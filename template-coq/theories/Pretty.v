@@ -1,9 +1,43 @@
 From Coq Require Import PrimString Uint63.
-From MetaCoq.Template Require Import All.
+From MetaCoq.Template Require Import Ast.
 From MetaCoq.Utils Require Import utils.
 From PPrint Require Import All.
 
 Open Scope pstring.
+
+(** * Pretty-printing configuration. *)
+
+Module Config.
+
+(** The pretty-printing functions can show a variable amount of information,
+    depending on the printing configuration. *)
+Record t := mk
+  { (** Should we print universes ? *)
+    cf_universes : bool 
+  ; (** Should we print evar instances ? *)
+    cf_evar_instances : bool 
+  ; (** Should we print relevance information ? *)
+    cf_relevance : bool 
+  ; (** Should we print match predicates ? *)
+    cf_match_preds : bool
+  ; (** Should we print all parentheses ? *) 
+    cf_parentheses : bool }.
+
+(** Don't print any low-level details. *)
+Definition default : t := mk false false false false false.
+  
+(** Print all low-level details. *)
+Definition all : t := mk true true true true true.
+
+(** Helper function to add universe printing to a configuration. *)
+Definition with_universes (cf : t) : t :=
+  {| cf_universes := true 
+  ;  cf_evar_instances := cf.(cf_evar_instances)
+  ;  cf_relevance := cf.(cf_relevance)
+  ;  cf_match_preds := cf.(cf_match_preds) 
+  ;  cf_parentheses := cf.(cf_parentheses) |}.
+  
+End Config.
 
 (** * Utils *)
 
@@ -117,32 +151,6 @@ Definition string_of_constructor (ind : inductive) (ctor_idx : nat) : bstring :=
 
 End NameHandling.
 
-(** * Pretty-printing configuration. *)
-
-Module Config.
-
-(** The pretty-printing functions can show a variable amount of information,
-    depending on the printing configuration. *)
-Record t := mk
-  { (** Should we print universes ? *)
-    with_universes : bool 
-  ; (** Should we print evar instances ? *)
-    with_evar_instances : bool 
-  ; (** Should we print relevance information ? *)
-    with_relevance : bool 
-  ; (** Should we print match predicates ? *)
-    with_match_preds : bool
-  ; (** Should we print all parentheses ? *) 
-    with_parentheses : bool }.
-
-(** Don't print any low-level details. *)
-Definition basic : t := mk false false false false false.
-  
-(** Print all low-level details. *)
-Definition all : t := mk true true true true true.
-  
-End Config.
-
 (** Pretty-printing. *)
 
 Section Printing.
@@ -154,7 +162,7 @@ Context (env : global_env_ext).
 (** [paren_if top d] adds parentheses around document [d] if [top] is equal to [false].
     It takes into account the configuration option to force parentheses. *)
 Definition paren_if {A} (top : bool) (d : doc A) : doc A :=
-  if Config.with_parentheses config || negb top then paren d else d.
+  if Config.cf_parentheses config || negb top then paren d else d.
   
 Definition print_name (n : name) : doc unit :=
   match n with 
@@ -169,7 +177,16 @@ Definition print_level (l : Level.t) : doc unit :=
   match l with 
   | Level.lzero => str "Set"
   | Level.level s => bstr s
-  | Level.lvar n => str "lvar" ^^ nat10 n
+  | Level.lvar n => 
+    (* For level variables, we try to get the name of the level in the local universe context. *)
+    match snd env with 
+    | Monomorphic_ctx => str "lvar" ^^ nat10 n
+    | Polymorphic_ctx (univ_names, _) => 
+      match List.nth_error univ_names n with 
+      | Some uname => print_name uname 
+      | None => str "lvar" ^^ nat10 n
+      end
+    end
   end.
 
 Definition print_level_expr (le : LevelExprSet.elt) : doc unit :=
@@ -183,20 +200,28 @@ Definition print_sort (s : sort) :=
   | sProp => str "Prop"
   | sSProp => str "SProp"
   | sType l =>
-    if Config.with_universes config
+    if Config.cf_universes config
     then
-      let lvls := flow_map (str ";" ^^ break 0) print_level_expr $ LevelExprSet.elements l in 
-      bracket "Type(" lvls ")"
+      let lvls := flow_map (str "," ^^ break 0) print_level_expr $ LevelExprSet.elements l in 
+      bracket "Type@{" lvls "}"
     else str "Type"
   end.
 
 Definition print_univ_instance (uinst : Instance.t) : doc unit :=
-  if Config.with_universes config && negb (uinst == []) then 
+  if Config.cf_universes config && negb (uinst == []) then 
     let lvls := flow_map (break 0) print_level uinst in 
     bracket "@{" lvls "}"
   else 
     empty.
 
+(** Print the names bound by a universe declaration, but _not_ the constraints. *)
+Definition print_univ_decl (decl : universes_decl) : doc unit :=
+  match decl with 
+  | Monomorphic_ctx => empty 
+  | Polymorphic_ctx (unames, _) =>
+      bracket "@{" (flow_map (str "," ^^ break 0) print_name unames) "}"  
+  end.
+  
 (** Helper function to print a single definition in a fixpoint block. *)
 Definition print_def {A} (on_ty : A -> doc unit) (on_body : A -> doc unit) (def : def A) :=
   let n_doc := 
@@ -209,7 +234,9 @@ Definition print_def {A} (on_ty : A -> doc unit) (on_body : A -> doc unit) (def 
   let body_doc := on_body def.(dbody) in 
   (* We don't [align] here on purpose. *)
   group $ group (n_doc ^//^ ty_doc) ^//^ body_doc.
-               
+         
+  
+
 (** Helper function to print a single term of the form [tFix mfix n] or [tCoFix mfix n].
     The parameter [is_fix] controls whether to print a fixpoint or a co-fixpoint. *)
 Definition print_fixpoint (on_term : list ident -> term -> doc unit) (ctx : list ident) 
@@ -245,7 +272,7 @@ Fixpoint print_term (top : bool) (ctx : list ident) (t : term) {struct t} : doc 
     end
   | tVar n => str "Var(" ^^ bstr n ^^ str ")"
   | tEvar ev args => 
-    if Config.with_evar_instances config then 
+    if Config.cf_evar_instances config then 
       let args_doc := flow_map (str ";" ^^ break 0) (print_term true ctx) args in
       str "Evar(" ^^ nat10 ev ^^ bracket "[" args_doc "]" ^^ str ")"
     else 
@@ -406,40 +433,45 @@ Definition print_recursivity_kind k : doc unit :=
   | BiFinite => str "Variant"
   end.
 
-Print constructor_body.
-
-(** Print a single inductive constructor.
-    This assumes [ctx] contains names for the other inductives in the block as well
-    as the inductive parameters. *)
-Definition print_one_cstr (ctx : list ident) (ind : one_inductive_body) (ctor : constructor_body) : doc unit :=
+(** Helper function to print a single constructor.
+    - [ctx] should contain the names of the other inductives in the block as well
+      as the inductive parameters. 
+    - [params] is the list of parameters (ordered from first to last) represented as 
+      local variables (tRel). *)
+Definition print_one_cstr (ctx : list ident) (ind : inductive) (params : list term) (ctor : constructor_body) : doc unit :=
   (* TODO : handle universes for [tInd]. *)
-  let ind_kname := (MPfile [], ind.(ind_name)) in
-  let ctor_ty := it_mkProd_or_LetIn ctor.(cstr_args) $ mkApps (tInd ind_kname []) ctor.(cstr_indices) in
-  let ctx_args := push_context env ctor.(cstr_args) ctx in
-  align $ group $ bstr ctor.(cstr_name) ^+^ str ":" ^//^ print_term true ctx_args ctor_ty.
+  let n_args := List.length ctor.(cstr_args) in
+  let ctor_ty := 
+    it_mkProd_or_LetIn ctor.(cstr_args) $ 
+    mkApps (tInd ind []) $ 
+    (List.map (lift0 n_args) params) ++ ctor.(cstr_indices) 
+  in
+  align $ group $ bstr ctor.(cstr_name) ^+^ str ":" ^//^ print_term true ctx ctor_ty.
 
-(** Print a single inductive. *)
+(** Helper function to print a single inductive.
+    - [header] is the keyword which should be printed before the inductive name 
+      (usually it is [Inductive] or [with]).
+    - [ctx] should contain the names of the other inductives in the block. *)
 Definition print_one_ind (header : doc unit) (short : bool) (ctx : list ident) 
-  (body : one_inductive_body) (mbody : mutual_inductive_body) : doc unit :=
-  let '(ctx_params, params) := print_context ctx mbody.(ind_params) in
+  (mbody : mutual_inductive_body) (body : one_inductive_body) (ind : inductive) : doc unit :=
+  let '(ctx_params, param_docs) := print_context ctx mbody.(ind_params) in
+  let params := List.rev (mapi (fun i _ => tRel i) mbody.(ind_params)) in
   let arity := it_mkProd_or_LetIn body.(ind_indices) (tSort body.(ind_sort)) in
-  (* part1 is [ind params : arity :=]*)
+  (* part1 is [ind_name@{univs} params : arity :=]*)
   let part1 := flow (break 2) $ 
     header ::
-    bstr body.(ind_name) ::
-    List.rev params ++
+    (bstr body.(ind_name) ^^ print_univ_decl (snd env)) ::
+    List.rev param_docs ++
     [ str ":"
     ; print_term true ctx_params arity
     ; str ":=" ]
   in 
   (* part2 is [C1 : ... | C2 : ... | C2 : ...] *)
   let part2 := 
-    if short then str "..." 
-    else group $ 
-      break 0 ^^ ifflat empty (str "|" ^^ space) ^^
-      separate_map (break 0 ^^ str "|" ^^ space) (print_one_cstr ctx_params body) body.(ind_ctors)
+    ifflat empty (str "|" ^^ space) ^^
+    separate_map (break 0 ^^ str "|" ^^ space) (print_one_cstr ctx_params ind params) body.(ind_ctors)
   in
-  align $ part1 ^^ part2.
+  align $ flow (break 0) [part1 ; if short then str "..." else part2].
 
 (*Definition print_one_cstr_entry Γ (mie : mutual_inductive_entry) (c : ident × term) : t :=
   c.1 ^ " : " ^ print_term Γ true c.2.
@@ -452,24 +484,25 @@ Definition print_one_ind_entry (short : bool) Γ (mie : mutual_inductive_entry) 
 
 End Env.
 
+(** Print a mutual inductive block. *)
+Definition print_mutual_inductive (env : global_env) (short : bool) (ind_kname : kername) (mbody : mutual_inductive_body) : doc unit :=
+  let ext_env := (env, mbody.(ind_universes)) in
+  let ctx := push_context ext_env (arities_context mbody.(ind_bodies)) [] in
+  align $ group $ 
+    separate (break 0) $ mapi 
+      (fun i body => 
+        let header := if i == 0 then print_recursivity_kind mbody.(ind_finite) else str "with" in
+        print_one_ind ext_env header short ctx mbody body (mkInd ind_kname i))
+      mbody.(ind_bodies).
+  
 Definition universes_decl_of_universes_entry e :=
   match e with
   | Monomorphic_entry ctx => Monomorphic_ctx
   | Polymorphic_entry uctx => Polymorphic_ctx (fst uctx, snd (snd uctx))
   end.
+      
 
-Definition print_mutual_inductive (env : global_env) (short : bool) (ind : inductive) (mbody : mutual_inductive_body) : doc unit :=
-  let ext_env := (env, mbody.(ind_universes)) in
-  let ctx := push_context ext_env (arities_context mbody.(ind_bodies)) [] in
-  align $ group $ 
-    print_recursivity_kind mbody.(ind_finite) ^+^
-    separate (break 0) $ mapi 
-      (fun i => 
-        let header := if i == 0 then print_recursivity_kind mbody.(ind_finite) else str "with" in
-        print_one_ind ext_env header short ctx)
-      mbody.(ind_bodies).
-  
-Definition mie_arities_context mie :=
+(*Definition mie_arities_context mie :=
   rev_map (fun ind => vass (mkBindAnn (nNamed ind.(mind_entry_typename)) Relevant)
     (it_mkProd_or_LetIn mie.(mind_entry_params) ind.(mind_entry_arity)))
     mie.(mind_entry_inds).
@@ -517,4 +550,41 @@ Definition print_env (short : bool) (prefix : nat) Σ :=
   Tree.to_string (PrintTermTree.print_env true short prefix Σ).
 
 Definition print_program (short : bool) (prefix : nat) (p : program) : string :=
-  Tree.to_string (PrintTermTree.print_program true short prefix p).
+  Tree.to_string (PrintTermTree.print_program true short prefix p).*)
+
+End Printing.
+
+From MetaCoq.Template Require Import TemplateMonad Loader.
+Import MCMonadNotation.
+
+Inductive vec A B C : nat -> Type :=
+  | VNil : vec A B C 0
+  | VCons : forall n, A -> B -> C -> vec B A C n -> vec A B C (S n).
+
+
+Set Universe Polymorphism.
+Polymorphic Inductive Even@{u} : nat -> Type@{u} := 
+  | EvenO : Even 0 
+  | EvenS : forall n, Odd n -> Even (S n)
+with Odd : nat -> Type@{u} :=
+  | Odd1 : Odd 1
+  | OddS : forall n, Even n -> Odd (S n).
+
+Definition test : TemplateMonad unit :=
+  mlet (env, ind) <- tmQuoteRec Even ;;
+  mlet ind <- 
+    match ind with 
+    | tInd ind _ => ret ind 
+    | _ => tmFail "not and inductive"%bs
+    end
+  ;;
+  mlet (mbody, body) <- 
+    match lookup_inductive env ind with
+    | Some res => ret res 
+    | None => tmFail "lookup_inductive failed"%bs
+    end
+  ;;
+  tmPrint =<< tmEval cbv $ pp_string 80 $ 
+    print_mutual_inductive (Config.with_universes Config.default) env false ind.(inductive_mind) mbody.
+
+MetaCoq Run test.
