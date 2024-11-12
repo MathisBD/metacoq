@@ -21,13 +21,15 @@ Record t := mk
   ; (** Should we print match predicates ? *)
     cf_match_preds : bool
   ; (** Should we print all parentheses ? *) 
-    cf_parentheses : bool }.
+    cf_parentheses : bool 
+  ; (** Should we print full kernel names ? *)
+    cf_full_names : bool }.
 
 (** Don't print any low-level details. *)
-Definition default : t := mk false false false false false.
+Definition default : t := mk false false false false false false.
   
 (** Print all low-level details. *)
-Definition all : t := mk true true true true true.
+Definition all : t := mk true true true true true true.
 
 (** Helper function to add universe printing to a configuration. *)
 Definition with_universes (cf : t) : t :=
@@ -35,7 +37,8 @@ Definition with_universes (cf : t) : t :=
   ;  cf_evar_instances := cf.(cf_evar_instances)
   ;  cf_relevance := cf.(cf_relevance)
   ;  cf_match_preds := cf.(cf_match_preds) 
-  ;  cf_parentheses := cf.(cf_parentheses) |}.
+  ;  cf_parentheses := cf.(cf_parentheses)
+  ;  cf_full_names := cf.(cf_full_names) |}.
   
 End Config.
 
@@ -170,8 +173,37 @@ Definition print_name (n : name) : doc unit :=
   | nNamed n => bstr n
   end. 
 
-Definition print_kername (kn : kername) : doc unit :=
-  bstr $ snd kn.
+About Instance.t.
+
+(** Print a kernel name. This is not so simple : 
+    - the configuration options might require us to print the full name.
+    - we treat single-letter labels specially, e.g. [MetaCoq.Common.Universes.Instance.t]
+      is printed as [Instance.t] instead of just [t]. *)
+Definition print_kername (kname : kername) : doc unit :=
+  (* Helper function get the identifiers in a module path. *)
+  let fix modpath_ids path acc :=
+    match path with 
+    | MPfile dirpath => List.rev dirpath ++ acc
+    | MPbound dirpath id _ => 
+      (* TODO : is this correct ? *)
+      List.rev (id :: dirpath)
+    | MPdot path id => modpath_ids path (id :: acc)
+    end
+  in
+  let (modpath, label) := kname in
+  let path := modpath_ids modpath [] in 
+  if Config.cf_full_names config then 
+    (* If the config option is set, print the full module path. *)
+    flow_map (str ".") bstr $ path ++ [label]
+  else if String.length label <=? 1 then 
+    (* If the label is very short, print the last part of the modpath + the label. *)
+    match List.last (List.map Some path) None with 
+    | Some prefix => flow_map (str ".") bstr $ [prefix ; label]
+    | None => bstr label 
+    end
+  else 
+    (* Otherwise print only the identifier *)
+    bstr label.
 
 Definition print_level (l : Level.t) : doc unit :=
   match l with 
@@ -305,10 +337,10 @@ Fixpoint print_term (top : bool) (ctx : list ident) (t : term) {struct t} : doc 
     let n_doc := str "let" ^+^ bstr n ^+^ str ":" in
     let ty_doc := print_term true ctx ty ^+^ str ":=" in
     let def_doc := print_term true ctx def in
-    let body_doc := group (str "in" ^/^ print_term true (n :: ctx) body) in
+    let body_doc := print_term true (n :: ctx) body in
     (* Getting the formatting correct is a bit tricky. *)
-    group $ align $ 
-      group (n_doc ^//^ ty_doc) ^//^ def_doc ^/^ body_doc
+    let line := group $ group (n_doc ^//^ ty_doc) ^//^ def_doc ^/^ str "in" in 
+    align $ group $ line ^/^ body_doc
   | tApp f args =>
     paren_if top $ align $ flow_map (break 2) (print_term false ctx) (f :: args) 
   | tConst kname uinst => print_kername kname ^^ print_univ_instance uinst
@@ -430,7 +462,7 @@ Definition print_recursivity_kind k : doc unit :=
   match k with
   | Finite => str "Inductive"
   | CoFinite => str "CoInductive"
-  | BiFinite => str "Variant"
+  | BiFinite => str "Record"
   end.
 
 (** Helper function to print a single constructor.
@@ -485,7 +517,8 @@ Definition print_one_ind_entry (short : bool) Γ (mie : mutual_inductive_entry) 
 End Env.
 
 (** Print a mutual inductive block. *)
-Definition print_mutual_inductive (env : global_env) (short : bool) (ind_kname : kername) (mbody : mutual_inductive_body) : doc unit :=
+Definition print_mutual_inductive (env : global_env) (short : bool) (ind_kname : kername) 
+  (mbody : mutual_inductive_body) : doc unit :=
   let ext_env := (env, mbody.(ind_universes)) in
   let ctx := push_context ext_env (arities_context mbody.(ind_bodies)) [] in
   align $ group $ 
@@ -495,87 +528,69 @@ Definition print_mutual_inductive (env : global_env) (short : bool) (ind_kname :
         print_one_ind ext_env header short ctx mbody body (mkInd ind_kname i))
       mbody.(ind_bodies).
   
-Definition universes_decl_of_universes_entry e :=
-  match e with
-  | Monomorphic_entry ctx => Monomorphic_ctx
-  | Polymorphic_entry uctx => Polymorphic_ctx (fst uctx, snd (snd uctx))
-  end.
-      
-
-(*Definition mie_arities_context mie :=
-  rev_map (fun ind => vass (mkBindAnn (nNamed ind.(mind_entry_typename)) Relevant)
-    (it_mkProd_or_LetIn mie.(mind_entry_params) ind.(mind_entry_arity)))
-    mie.(mind_entry_inds).
-Definition print_mie Σ with_universes (short : bool) (mie : mutual_inductive_entry) : t :=
-  let Σ' := (Σ, universes_decl_of_universes_entry mie.(mind_entry_universes)) in
-  let names := fresh_names Σ' [] (mie_arities_context mie) in
-    (print_recursivity_kind mie.(mind_entry_finite) ^ " " ^
-    print_list (print_one_ind_entry Σ' with_universes short names mie) (nl ^ "with ") mie.(mind_entry_inds) ^ "." ^ nl).
-Fixpoint print_env_aux with_universes (short : bool) (prefix : nat) (Σ : global_env) (acc : t) : t :=
-  match prefix with
-  | 0 => match Σ.(declarations) with [] => acc | _ => ("..." ^ nl ^ acc) end
-  | S n =>
-    let univs := Σ.(Env.universes) in
-    let retro := Σ.(Env.retroknowledge) in
-    match Σ.(declarations) with
-    | [] => acc
-    | (kn, InductiveDecl mib) :: Σ =>
-      let Σ := {| Env.universes := univs; declarations := Σ; retroknowledge := retro |} in
-      print_env_aux with_universes short n Σ (print_mib Σ with_universes short mib ^ acc)
-    | (kn, ConstantDecl cb) :: Σ =>
-      let Σ' := ({| Env.universes := univs; declarations := Σ; retroknowledge := retro |}, cb.(cst_universes)) in
-      print_env_aux with_universes short n Σ'.1
-        ((match cb.(cst_body) with
-          | Some _ => "Definition "
-          | None => "Axiom "
-        end) ^ string_of_kername kn ^ " : " ^ print_term Σ' with_universes nil true cb.(cst_type) ^
-        match cb.(cst_body) with
-        | Some b =>
-          if short then ("..." ^ nl)
-          else (" := " ^ nl ^ print_term Σ' with_universes nil true b ^ "." ^ nl)
-        | None => "."
-        end ^ acc)
+(** Print a constant. *)
+Definition print_constant (env : global_env) (short : bool) (kname : kername) 
+  (cst : constant_body) : doc unit :=
+  let ext_env := (env, cst.(cst_universes)) in
+  let ctx := [] in
+  let header := 
+    match cst.(cst_body) with 
+    | Some _ => str "Definition" 
+    | None => str "Axiom" 
     end
-  end.
-Definition print_env with_universes (short : bool) (prefix : nat) Σ :=
-  print_env_aux with_universes short prefix Σ (Tree.string "").
-Definition print_program with_universes (short : bool) (prefix : nat) (p : program) : t :=
-  print_env with_universes short prefix (fst p) ^ nl ^ print_term (empty_ext (fst p)) with_universes nil true (snd p).
-d PrintTermTree.
-finition print_mie Σ with_universes short := Tree.to_string ∘ PrintTermTree.print_mie Σ with_universes short.
-finition print_mib Σ with_universes short := Tree.to_string ∘ PrintTermTree.print_mib Σ with_universes short.
-efinition print_term Σ Γ top := Tree.to_string ∘ PrintTermTree.print_term Σ true Γ top.
-
-Definition print_env (short : bool) (prefix : nat) Σ :=
-  Tree.to_string (PrintTermTree.print_env true short prefix Σ).
-
-Definition print_program (short : bool) (prefix : nat) (p : program) : string :=
-  Tree.to_string (PrintTermTree.print_program true short prefix p).*)
+  in
+  let body :=
+    if short then group $ str ":=" ^/^ str "..." else 
+    match cst.(cst_body) with 
+    | Some body => group $ str ":=" ^/^ print_term ext_env true ctx body
+    | None => empty 
+    end
+  in
+  align $ flow (break 2)
+    [ header ; (print_kername kname ^^ print_univ_decl cst.(cst_universes))
+    ; str ":" ; print_term ext_env true ctx cst.(cst_type) 
+    ; body ].
+  
+(** Print all the declarations in a global environment. *)
+Definition print_env (env : global_env) (short : bool) : doc unit :=
+  let fix loop decls acc :=
+    match decls with 
+    | [] => separate (hardline ^^ if short then empty else hardline) acc
+    | (kname, decl) :: decls =>
+      let doc := 
+        match decl with 
+        | ConstantDecl cst => print_constant env short kname cst 
+        | InductiveDecl mbody => print_mutual_inductive env short kname mbody
+        end
+      in 
+      loop decls (doc :: acc)
+    end 
+  in 
+  loop env.(declarations) [].
 
 End Printing.
+
+(**********)
+(* Testing. *)
 
 From MetaCoq.Template Require Import TemplateMonad Loader.
 Import MCMonadNotation.
 
-Inductive vec A B C : nat -> Type :=
-  | VNil : vec A B C 0
-  | VCons : forall n, A -> B -> C -> vec B A C n -> vec A B C (S n).
+Definition test_env : TemplateMonad unit :=
+  mlet (env, _) <- tmQuoteRec term ;;
+  tmPrint =<< tmEval cbv $ 
+    pp_string 80 $ print_env Config.default env false.
 
+(* TODO : use precedences *)
+(* TODO : make [short] into a config option. maybe [skip_definitions] ?*)
+(* TODO : group lambdas and products together *)
 
-Set Universe Polymorphism.
-Polymorphic Inductive Even@{u} : nat -> Type@{u} := 
-  | EvenO : Even 0 
-  | EvenS : forall n, Odd n -> Even (S n)
-with Odd : nat -> Type@{u} :=
-  | Odd1 : Odd 1
-  | OddS : forall n, Even n -> Odd (S n).
-
-Definition test : TemplateMonad unit :=
+(*Definition test_ind : TemplateMonad unit :=
   mlet (env, ind) <- tmQuoteRec Even ;;
   mlet ind <- 
     match ind with 
     | tInd ind _ => ret ind 
-    | _ => tmFail "not and inductive"%bs
+    | _ => tmFail "not an inductive"%bs
     end
   ;;
   mlet (mbody, body) <- 
@@ -585,6 +600,27 @@ Definition test : TemplateMonad unit :=
     end
   ;;
   tmPrint =<< tmEval cbv $ pp_string 80 $ 
-    print_mutual_inductive (Config.with_universes Config.default) env false ind.(inductive_mind) mbody.
+    print_mutual_inductive (Config.with_universes Config.default) env false ind.(inductive_mind) mbody.*)
 
-MetaCoq Run test.
+Definition mydef (env : global_env) (inst : Instance.t) (short : bool) (kname : kername) 
+  (cst : constant_body) : doc unit :=
+  let ext_env := (env, cst.(cst_universes)) in
+  let ctx : list ident := [] in 
+  @empty unit. 
+
+Definition test_cst : TemplateMonad unit :=
+  mlet (env, cst) <- tmQuoteRec mydef ;;
+  mlet kname <- 
+    match cst with 
+    | tConst kname _ => ret kname 
+    | _ => tmFail "not a constant"%bs
+    end
+  ;;
+  mlet cst <- 
+    match lookup_constant env kname with
+    | Some res => ret res 
+    | None => tmFail "lookup_constant failed"%bs
+    end
+  ;;
+  tmPrint =<< tmEval cbv $ pp_string 80 $ 
+    print_constant (Config.all) env false kname cst.
