@@ -311,6 +311,15 @@ Module Environment (T : Term).
   Definition fix_context (m : mfixpoint term) : context :=
     List.rev (mapi (fun i d => vass d.(dname) (lift i 0 d.(dtype))) m).
 
+  (** Named Contexts *)
+
+  (** A named context maps identifiers to local declarations. 
+      The most recent declarations are at the head of the list.
+      
+      As an invariant, declarations in the named context should not 
+      contain unbound [tRel]s (but can contain [tVar]s). *)
+  Definition named_context := list (ident * context_decl).
+
   (** *** Environments *)
 
   Record constructor_body := {
