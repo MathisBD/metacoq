@@ -26,7 +26,7 @@ Record t := mk
     cf_full_names : bool }.
 
 (** Don't print any low-level details. *)
-Definition default : t := mk false false false false false false.
+Definition none : t := mk false false false false false false.
   
 (** Print all low-level details. *)
 Definition all : t := mk true true true true true true.
@@ -573,7 +573,7 @@ End Printing.
 (**********)
 (* Testing. *)
 
-From MetaCoq.Template Require Import TemplateMonad Loader.
+(*From MetaCoq.Template Require Import TemplateMonad Loader.
 Import MCMonadNotation.
 
 Definition test_env : TemplateMonad unit :=
@@ -623,4 +623,4 @@ Definition test_cst : TemplateMonad unit :=
     end
   ;;
   tmPrint =<< tmEval cbv $ pp_string 80 $ 
-    print_constant (Config.all) env false kname cst.
+    print_constant (Config.all) env false kname cst.*)
