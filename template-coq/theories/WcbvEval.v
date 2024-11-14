@@ -179,6 +179,7 @@ Definition cstr_arity mdecl cdecl :=
 Section Wcbv.
 
   Context (Σ : global_env).
+  
   (* The local context is fixed: we are only doing weak reductions *)
 
   Inductive eval : term -> term -> Type :=

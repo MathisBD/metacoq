@@ -18,7 +18,7 @@ Definition template_program_env := (TemplateEnvMap.GlobalEnvMap.t * Ast.term).
 
 Definition wt_template_program {cf : checker_flags} (p : template_program) :=
   let Σ := Ast.Env.empty_ext p.1 in
-  wf_ext Σ × ∑ T, Σ ;;; [] |- p.2 : T.
+  wf_ext Σ × ∑ T, Σ ;;; [] ;;; [] |- p.2 : T.
 
 (** Evaluation relation on template programs *)
 
@@ -29,7 +29,7 @@ Definition eval_template_program (p : Ast.Env.program) (v : Ast.term) :=
 
 Definition wt_template_program_env {cf : checker_flags} (p : template_program_env) :=
   let Σ := Ast.Env.empty_ext p.1 in
-  wf_ext Σ × ∑ T, Σ ;;; [] |- p.2 : T.
+  wf_ext Σ × ∑ T, Σ ;;; [] ;;; [] |- p.2 : T.
 
 (** Evaluation relation on template programs *)
 

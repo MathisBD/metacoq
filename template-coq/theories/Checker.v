@@ -6,7 +6,7 @@ Import MCMonadNotation.
 
 (** * Coq type-checker for kernel terms
 
-  Implemets [typecheck_program] which returns an error and
+  Implements [typecheck_program] which returns an error and
   on success should guarantee that the term has the given type.
   Currently uses fuel to implement reduction and is unverified.
 
@@ -163,7 +163,7 @@ Section Lookups.
 End Lookups.
 
 Section Reduce.
-  Context (flags : RedFlags.t) (Σ : global_env).
+  Context (flags : RedFlags.t) (Σ : global_env) (Δ : named_context).
 
   Definition zip (t : term * list term) := mkApps (fst t) (snd t).
 
@@ -178,6 +178,15 @@ Section Reduce.
       match d.(decl_body) with
       | None => ret (t, stack)
       | Some b => reduce_stack Γ n (lift0 (S c) b) stack
+      end
+    else ret (t, stack)
+
+  | tVar v =>
+    if RedFlags.delta flags then 
+      d <- nctx_lookup Δ v ;;
+      match d.(decl_body) with 
+      | None => ret (t, stack)
+      | Some b => reduce_stack Γ n b stack
       end
     else ret (t, stack)
 
@@ -428,7 +437,7 @@ Fixpoint leq_term `{checker_flags} (φ : universes_graph) (t u : term) {struct t
 Section Conversion.
 
   Context `{checker_flags} (flags : RedFlags.t).
-  Context (Σ : global_env) (G : universes_graph).
+  Context (Σ : global_env) (G : universes_graph)  (Δ : named_context).
 
   Definition nodelta_flags := RedFlags.mk true true true false true true.
 
@@ -436,13 +445,13 @@ Section Conversion.
     unf <- unfold_fix mfix idx ;;
     let '(arg, fn) := unf in
     c <- nth_error l arg ;;
-    cred <- reduce_stack RedFlags.default Σ Γ n c [] ;;
+    cred <- reduce_stack RedFlags.default Σ Δ Γ n c [] ;;
     let '(cred, _) := cred in
     if negb (isConstruct cred) then None
     else Some fn.
 
   Definition unfold_one_case n Γ c :=
-    cred <- reduce_stack_term RedFlags.default Σ Γ n c ;;
+    cred <- reduce_stack_term RedFlags.default Σ Δ Γ n c ;;
     if negb (isConstruct cred || isCoFix cred) then None
     else Some cred.
 
@@ -464,6 +473,11 @@ Section Conversion.
       | Some (ConstantDecl {| cst_body := Some body |}) => Some body
       | _ => None
       end
+    | tVar v =>  
+      match nctx_lookup Δ v with 
+      | Some decl => decl.(decl_body)
+      | None => None 
+      end
     | _ => None
     end.
 
@@ -479,8 +493,8 @@ Section Conversion.
   Fixpoint isconv (n : nat) (leq : conv_pb) (Γ : context)
            (t1 : term) (l1 : list term) (t2 : term) (l2 : list term) {struct n} : option bool :=
     match n with 0 => None | S n =>
-    red1 <- reduce_stack nodelta_flags Σ Γ n t1 l1 ;;
-    red2 <- reduce_stack nodelta_flags Σ Γ n t2 l2 ;;
+    red1 <- reduce_stack nodelta_flags Σ Δ Γ n t1 l1 ;;
+    red2 <- reduce_stack nodelta_flags Σ Δ Γ n t2 l2 ;;
     let '(t1,l1) := red1 in
     let '(t2,l2) := red2 in
     isconv_prog n leq Γ t1 l1 t2 l2
@@ -499,13 +513,13 @@ Section Conversion.
     let fallback (x : unit) :=
       match reducible_head n Γ t1 l1 with
       | Some t1 =>
-        redt <- reduce_stack nodelta_flags Σ Γ n t1 l1 ;;
+        redt <- reduce_stack nodelta_flags Σ Δ Γ n t1 l1 ;;
         let '(t1, l1) := redt in
         isconv_prog n leq Γ t1 l1 t2 l2
       | None =>
         match reducible_head n Γ t2 l2 with
         | Some t2 =>
-          redt <- reduce_stack nodelta_flags Σ Γ n t2 l2 ;;
+          redt <- reduce_stack nodelta_flags Σ Δ Γ n t2 l2 ;;
           let '(t2, l2) := redt in
           isconv_prog n leq Γ t1 l1 t2 l2
         | None =>
@@ -561,8 +575,8 @@ Section Conversion.
       && forallb2 (fun br br' => eq_term G br.(bbody) br'.(bbody)) brs brs' then
         ret true
       else
-        cred <- reduce_stack_term RedFlags.default Σ Γ n c ;;
-        c'red <- reduce_stack_term RedFlags.default Σ Γ n c' ;;
+        cred <- reduce_stack_term RedFlags.default Σ Δ Γ n c ;;
+        c'red <- reduce_stack_term RedFlags.default Σ Δ Γ n c' ;;
         if eq_term G cred c && eq_term G c'red c' then ret true
         else
           isconv n leq Γ (tCase ci p cred brs) l1 (tCase ci' p c'red brs') l2
@@ -575,13 +589,13 @@ Section Conversion.
       else
         match unfold_one_fix n Γ mfix idx l1 with
         | Some t1 =>
-          redt <- reduce_stack nodelta_flags Σ Γ n t1 l1 ;;
+          redt <- reduce_stack nodelta_flags Σ Δ Γ n t1 l1 ;;
           let '(t1, l1) := redt in
           isconv_prog n leq Γ t1 l1 t2 l2
         | None =>
           match unfold_one_fix n Γ mfix' idx' l2 with
           | Some t2 =>
-            redt <- reduce_stack nodelta_flags Σ Γ n t2 l2 ;;
+            redt <- reduce_stack nodelta_flags Σ Δ Γ n t2 l2 ;;
             let '(t2, l2) := redt in
             isconv_prog n leq Γ t1 l1 t2 l2
           | None => ret false
@@ -596,14 +610,14 @@ Section Conversion.
     end.
 End Conversion.
 
-Definition try_reduce Σ Γ n t :=
-  match reduce_opt RedFlags.default Σ Γ n t with
+Definition try_reduce Σ Δ Γ n t :=
+  match reduce_opt RedFlags.default Σ Δ Γ n t with
   | Some t' => t'
   | None => t
   end.
 
-Definition check_conv_gen `{checker_flags} {F:Fuel} conv_pb Σ G Γ t u :=
-  match isconv Σ G fuel conv_pb Γ t [] u [] with
+Definition check_conv_gen `{checker_flags} {F:Fuel} conv_pb Σ G Δ Γ t u :=
+  match isconv Σ G Δ fuel conv_pb Γ t [] u [] with
   | Some b => if b then ret () else raise (NotConvertible Γ t u t u)
   | None => raise (NotEnoughFuel fuel)
   end.
@@ -617,16 +631,16 @@ Definition is_graph_of_global_env_ext `{checker_flags} Σ G :=
 
 Section Typecheck.
   Context {F : Fuel}.
-  Context (Σ : global_env).
+  Context (Σ : global_env) (Δ : named_context).
 
   Definition hnf_stack Γ t :=
-    match reduce_stack RedFlags.default Σ Γ fuel t [] with
+    match reduce_stack RedFlags.default Σ Δ Γ fuel t [] with
     | Some t' => ret t'
     | None => raise (NotEnoughFuel fuel)
     end.
 
   Definition reduce Γ t :=
-    match reduce_opt RedFlags.default Σ Γ fuel t with
+    match reduce_opt RedFlags.default Σ Δ Γ fuel t with
     | Some t' => ret t'
     | None => raise (NotEnoughFuel fuel)
     end.
@@ -667,18 +681,18 @@ End Typecheck.
 
 Section Typecheck.
   Context {cf : checker_flags} {F : Fuel}.
-  Context (Σ : global_env) (G : universes_graph).
+  Context (Σ : global_env) (G : universes_graph) (Δ : named_context).
 
   Definition convert_leq Γ (t u : term) : typing_result unit :=
     if eq_term G t u then ret ()
     else
-      match isconv Σ G fuel Cumul Γ t [] u [] with
+      match isconv Σ G Δ fuel Cumul Γ t [] u [] with
       | Some b =>
         if b then ret ()
         else raise (NotConvertible Γ t u t u)
       | None => (* fallback *)
-        t' <- reduce Σ Γ t ;;
-        u' <- reduce Σ Γ u ;;
+        t' <- reduce Σ Δ Γ t ;;
+        u' <- reduce Σ Δ Γ u ;;
         if leq_term G t' u' then ret ()
         else raise (NotConvertible Γ t u t' u')
       end.
@@ -691,7 +705,7 @@ Section Typecheck.
     match l with
     | nil => ret ty
     | cons x xs =>
-       pi <- reduce_to_prod Σ Γ ty ;;
+       pi <- reduce_to_prod Σ Δ Γ ty ;;
        let '(a1, b1) := pi in
        tx <- infer Γ x ;;
        convert_leq Γ tx a1 ;;
@@ -700,7 +714,7 @@ Section Typecheck.
 
     Definition infer_type Γ t :=
       tx <- infer Γ t ;;
-      reduce_to_sort Σ Γ tx.
+      reduce_to_sort Σ Δ Γ tx.
 
     Definition infer_cumul Γ t t' :=
       tx <- infer Γ t ;;
@@ -770,7 +784,7 @@ Section Typecheck.
 
     | tCase ci p c brs =>
       ty <- infer Γ c ;;
-      indargs <- reduce_to_ind Σ Γ ty ;;
+      indargs <- reduce_to_ind Σ Δ Γ ty ;;
       (** TODO check branches *)
       let '(ind, u, args) := indargs in
       if eq_inductive ind ci.(ci_ind) then
@@ -784,7 +798,7 @@ Section Typecheck.
 
     | tProj p c =>
       ty <- infer Γ c ;;
-      indargs <- reduce_to_ind Σ Γ ty ;;
+      indargs <- reduce_to_ind Σ Δ Γ ty ;;
       (* FIXME *)
       ret ty
 
@@ -857,13 +871,13 @@ Section Checker.
     end.
 
   Definition check_wf_type id Σ G t :=
-    wrap_error id (infer_type Σ (infer Σ G) [] t) ;; ret ().
+    wrap_error id (infer_type Σ [] (infer Σ G []) [] t) ;; ret ().
 
   Definition check_wf_judgement id Σ G t ty :=
-    wrap_error id (check Σ G [] t ty) ;; ret ().
+    wrap_error id (check Σ G [] [] t ty) ;; ret ().
 
   Definition infer_term Σ G t :=
-    wrap_error "" (infer Σ G [] t).
+    wrap_error "" (infer Σ G [] [] t).
 
   Definition check_wf_decl Σ G kn (g : global_decl) : EnvCheck () :=
     match g with
@@ -926,6 +940,6 @@ Definition infer' `{checker_flags} `{Fuel} (Σ : global_env_ext) Γ t
   := let uctx := (global_ext_uctx Σ) in
     match gc_of_uctx uctx with
      | None => raise (UnsatisfiableConstraints uctx.2)
-     | Some uctx => infer (fst Σ) (make_graph uctx) Γ t
+     | Some uctx => infer (fst Σ) (make_graph uctx) [] Γ t
      end.
 

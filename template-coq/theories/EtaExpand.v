@@ -1,7 +1,7 @@
 (** * Eta-expansion and proof generation **)
 
 (** We perform eta-expansion of template-coq terms and generate proofs that
-    we terms are equal to the originals. Since eta-conversion is part of the
+    the new terms are equal to the originals. Since eta-conversion is part of
     Coq's conversion, the proof is essentially [eq_refl].
     All dependencies are also expanded.*)
 
@@ -698,8 +698,8 @@ Proof.
   intros. subst. now eapply expanded_lift.
 Qed.
 
-Lemma Forall_typing_spine_Forall {cf : config.checker_flags} Σ Γ (P : term -> Prop) t_ty l t' s :
-  Forall_typing_spine Σ Γ
+Lemma Forall_typing_spine_Forall {cf : config.checker_flags} Σ Δ Γ (P : term -> Prop) t_ty l t' s :
+  Forall_typing_spine Σ Δ Γ
        (fun t _ : term => P t) t_ty l t' s ->
   Forall P l.
 Proof.
@@ -914,8 +914,8 @@ Qed.
 
 From Equations Require Import Equations.
 
-Lemma typing_wf_fixpoint {cf : config.checker_flags} Σ0 Γ0 mfix idx t_ty  :
-   Σ0;;; Γ0 |- tFix mfix idx : t_ty -> wf_fixpoint Σ0 mfix.
+Lemma typing_wf_fixpoint {cf : config.checker_flags} Σ0 Δ0 Γ0 mfix idx t_ty  :
+   Σ0 ;;; Δ0 ;;; Γ0 |- tFix mfix idx : t_ty -> wf_fixpoint Σ0 mfix.
 Proof.
   intros H.
   depind H; eauto.
@@ -959,8 +959,8 @@ Import bytestring.String.
 
 Local Open Scope bs.
 
-Lemma constructor_declared {cf : checker_flags} {Σ :global_env_ext} {Γ ind idx u ty} {wfΣ : wf Σ.1}:
-  Σ ;;; Γ |- tConstruct ind idx u : ty ->
+Lemma constructor_declared {cf : checker_flags} {Σ :global_env_ext} {Δ Γ ind idx u ty} {wfΣ : wf Σ.1}:
+  Σ ;;; Δ ;;; Γ |- tConstruct ind idx u : ty ->
   exists r, lookup_constructor Σ ind idx = Some r.
 Proof.
   intros H; depind H; eauto.
@@ -968,17 +968,17 @@ Proof.
   Unshelve. all: eauto.
 Qed.
 
-Lemma eta_expand_expanded {cf : config.checker_flags} {Σ : global_env_ext} Γ Γ' t T :
+Lemma eta_expand_expanded {cf : config.checker_flags} {Σ : global_env_ext} Δ Γ Γ' t T :
   wf Σ ->
-  typing Σ Γ t T ->
+  Σ ;;; Δ ;;; Γ |- t : T ->
   Forall2 (fun x y => match x with Some (n, t) => y.(decl_type) = t /\ context_assumptions (decompose_prod_assum [] y.(decl_type)).1 >= n | None => True end) Γ' Γ ->
   forall Σg : GlobalEnvMap.t, repr_decls Σg Σ.1 ->
   expanded Σ (map (fun x => match x with Some (n, _) => n | None => 0 end ) Γ') (eta_expand Σg Γ' t).
 Proof.
   intros wf Hty. revert Γ'.
-  eapply @typing_ind_env with (t := t) (Σ := Σ)
-    (P := fun (Σ : global_env_ext) Γ t T => forall Γ',  Forall2 (fun (x : option (nat × term)) (y : context_decl) =>
-          match x with
+  eapply @typing_ind_env with (t := t) (Σ := Σ) (Δ := Δ)
+    (P := fun (Σ : global_env_ext) Δ Γ t T => forall Γ',  Forall2 (fun (x : option (nat × term)) (y : context_decl) =>
+        match x with
         | Some (_, t0) => decl_type y = t0 /\ _
         | None => True
         end) Γ' Γ ->
@@ -988,8 +988,8 @@ Proof.
       | Some (n, _) => n
       | None => 0
       end) Γ') (eta_expand Σg Γ' t))
-    (Pj := fun (Σ : global_env_ext) Γ j => option_default (fun t => forall Γ',  Forall2 (fun (x : option (nat × term)) (y : context_decl) =>
-            match x with
+    (Pj := fun (Σ : global_env_ext) Δ Γ j => option_default (fun t => forall Γ',  Forall2 (fun (x : option (nat × term)) (y : context_decl) =>
+          match x with
           | Some (_, t0) => decl_type y = t0 /\ _
           | None => True
           end) Γ' Γ ->
@@ -999,32 +999,33 @@ Proof.
         | Some (n, _) => n
         | None => 0
         end) Γ') (eta_expand Σg Γ' t)) (j_term j) True)
-      (PΓ := fun _ _ _ => True);
+      (PΔ := fun _ _ _ => True)
+      (PΓ := fun _ _ _ _ _ => True);
     repeat match goal with
     | [ |- repr_decls _ _ -> _ ] => intros hrepr
     | _ => intro
     end; try now (cbn; eauto).
   - apply fst in X. destruct j_term => //. apply snd in X. simpl. apply X.
-  - cbn. eapply Forall2_nth_error_Some_r in H1 as (? & ? & ?); eauto.
-    rewrite H1.
+  - cbn. eapply Forall2_nth_error_Some_r in H2 as (? & ? & ?); eauto.
+    rewrite H2.
     destruct x as [[] | ].
-    + destruct H2. unfold eta_single. cbn.
+    + destruct H3. unfold eta_single. cbn.
       eapply expanded_fold_lambda.
       rewrite !Nat.sub_0_r. len. rewrite length_firstn. len.
       destruct n0.
-      * cbn. econstructor. now rewrite nth_error_map H1.
+      * cbn. econstructor. now rewrite nth_error_map H2.
       * rewrite seq_S rev_map_spec map_app rev_app_distr. subst.
-         rewrite <- context_assumptions_lift, !Nat.min_l; try lia.
+        rewrite <- context_assumptions_lift, !Nat.min_l; try lia.
         econstructor.
         -- rewrite nth_error_app2 repeat_length; try lia.
            replace (S n0 + n - S n0) with n by lia.
-           now rewrite nth_error_map  H1.
+           now rewrite nth_error_map H2.
         -- len. now rewrite length_seq.
         -- eapply Forall_forall. intros x [ | (? & <- & [_ ?] % in_seq) % in_rev % in_map_iff]; subst.
            all: econstructor; rewrite nth_error_app1; revgoals; [eapply nth_error_repeat; lia | rewrite repeat_length; lia].
-    + econstructor. now rewrite nth_error_map H1.
-  - cbn. econstructor. eapply (H1 (up Γ')); tea; econstructor; eauto.
-  - cbn. econstructor. eauto. eapply (H1 (up Γ')); tea; econstructor; eauto.
+    + econstructor. now rewrite nth_error_map H2.
+  - cbn. econstructor. eapply (H2 (up Γ')); tea; econstructor; eauto.
+  - cbn. econstructor. eauto. eapply (H2 (up Γ')); tea; econstructor; eauto.
   - specialize (H _ H2).
     assert (Forall(fun t : term => expanded Σ0 (map
     (fun x : option (nat × term) =>
@@ -1171,7 +1172,7 @@ Proof.
     eapply expanded_mkApps_tConstruct; eauto.
     rewrite rev_map_spec. now simpl_list. rewrite rev_map_spec -!List.map_rev.
     eapply Forall_forall. intros ? (? & <- & ?) % in_map_iff. econstructor.
-    eapply in_rev, in_seq in H2 as [_ ?]. cbn in *. len.
+    eapply in_rev, in_seq in H3 as [_ ?]. cbn in *. len.
     rewrite !length_firstn. len.
     assert ((context_assumptions
     (decompose_prod_assum []
@@ -1181,7 +1182,7 @@ Proof.
     rewrite nth_error_app1. 2:now rewrite nth_error_repeat. rewrite repeat_length. lia.
   - cbn. econstructor; eauto.
     * unfold map_branches. solve_all.
-      clear -hrepr X1 H8.
+      clear -hrepr X1 H9.
       set (Γ'' := map _ Γ'). cbn.
       enough (All (expanded Σ0 Γ'') (map (eta_expand Σg Γ') (pparams p ++ indices))).
       now rewrite map_app in X; eapply All_app in X as [].
@@ -1197,16 +1198,17 @@ Proof.
       eapply Forall2_app; solve_all.
 
       assert (#| (case_branch_context_gen (ci_ind ci) mdecl (pparams p)
-      (puinst p) (bcontext y) x)| = #|bcontext y|). { clear - a0.
+          (puinst p) (bcontext y) x)| = #|bcontext y|). { clear - a0.
         unfold case_branch_context_gen. rewrite map2_length.
         rewrite Nat.min_l; try lia. eapply All2_length in a0.
         unfold inst_case_context. unfold subst_context.
         unfold subst_instance, subst_instance_context, map_context.
         rewrite fold_context_k_length length_map. unfold aname. lia.
-      } revert H9. generalize ((case_branch_context_gen (ci_ind ci) mdecl (pparams p)
+      } revert H10. generalize ((case_branch_context_gen (ci_ind ci) mdecl (pparams p)
       (puinst p) (bcontext y) x)). clear -hrepr.
-      induction #|bcontext y|; intros []; cbn; intros; try congruence; econstructor; eauto.
-    - cbn. rewrite nth_error_map H0. cbn. unfold eta_fixpoint. unfold fst_ctx in *. cbn in *.
+      induction #|bcontext y| ; intros []; cbn; intros; try congruence ; eauto.
+
+  - cbn. rewrite nth_error_map H0. cbn. unfold eta_fixpoint. unfold fst_ctx in *. cbn in *.
     eapply expanded_fold_lambda.
     assert (#|(decompose_prod (dtype decl)).1.1| = #|(decompose_prod (dtype decl)).1.2|) as E1. { eapply decompose_prod12. }
     assert (rarg decl < context_assumptions (decompose_prod_assum [] (dtype decl)).1) as E2. { eapply wf_fixpoint_rarg; eauto. now eapply nth_error_In. }
@@ -1216,7 +1218,7 @@ Proof.
     + len. rewrite length_seq. lia.
     + fold lift. len.
       assert (Forall (fun x => isLambda (dbody x)) mfix).
-      { apply andb_and in H2. destruct H2 as [isl _]. solve_all. }
+      { apply andb_and in H3. destruct H3 as [isl _]. solve_all. }
       solve_all.
       { now eapply isLambda_lift, isLambda_eta_expand. }
       cbn in *.
@@ -1230,11 +1232,11 @@ Proof.
       eapply All2_rev. eapply All2_mapi. eapply All_All2_refl, Forall_All, Forall_forall.
       intros. split. reflexivity. cbn.
       rewrite <- context_assumptions_lift.
-      eapply wf_fixpoint_rarg in H4; eauto. len; lia.
+      eapply wf_fixpoint_rarg in H5; eauto. len; lia.
       Unshelve. all: eauto. cbn.  rewrite <- context_assumptions_lift. lia.
     + cbn - [rev_map seq]. rewrite rev_map_spec. eapply Forall_rev.
       eapply Forall_forall. intros ? (? & <- & ?) % in_map_iff. econstructor.
-      eapply in_seq in H4 as [_ ?]. cbn in *. len.
+      eapply in_seq in H5 as [_ ?]. cbn in *. len.
       rewrite !length_firstn.
       rewrite -> nth_error_app1. eapply nth_error_repeat.
       len; lia.
@@ -1245,10 +1247,9 @@ Proof.
      rewrite map_app map_repeat in e0. len. eapply e0; auto.
      eapply Forall2_app; eauto. unfold types.
      assert (#|Typing.fix_context mfix| = #|mfix|). { unfold Typing.fix_context. now len. }
-     revert H4. generalize (Typing.fix_context mfix). clear.
+     revert H5. generalize (Typing.fix_context mfix). clear.
      induction #|mfix|; intros []; cbn; intros; try congruence; econstructor; eauto.
   - cbn. econstructor; eauto. solve_all. eapply b; tea. solve_all.
-  - eapply typing_wf_local; eauto.
 Qed.
 
 Arguments tVar _%_bs.
@@ -1435,10 +1436,10 @@ Proof.
   cbn. rewrite GlobalEnvMap.lookup_env_spec. now cbn.
 Qed.
 
-Lemma eta_expand_context {cf} {Σ} {Σg : global_env_ext_map} {ctx} {wfΣ : Typing.wf_ext Σ} :
+Lemma eta_expand_context {cf} {Σ} {Σg : global_env_ext_map} {Δ Γ} {wfΣ : Typing.wf_ext Σ} :
   repr_decls Σg Σ ->
-  on_context (lift_typing typing) Σ ctx ->
-  expanded_context Σ [] (eta_context Σg 0 ctx).
+  on_context (lift_typing3 typing) Σ Δ Γ ->
+  expanded_context Σ [] (eta_context Σg 0 Γ).
 Proof.
   unfold on_context.
   red. intros hrepr wf. sq.
@@ -1450,27 +1451,27 @@ Proof.
   len. rewrite app_nil_r.
   destruct t1 as (t1 & s & t2 & _).
   cbn in t1, t2.
-  forward (eta_expand_expanded (Σ := Σ) Γ (repeat None #|Γ|) _ _ wfΣ t1).
+  forward (eta_expand_expanded (Σ := Σ) Δ Γ (repeat None #|Γ|) _ _ wfΣ t1).
   clear. induction Γ; cbn; constructor; auto.
   intros. specialize (H _ hrepr).
   move: H.
   now rewrite map_repeat.
 Qed.
 
-Lemma eta_expand_context_sorts {cf} {Σ} {Σg : global_env_ext_map} {ctx ctx' cunivs} {wfΣ : Typing.wf_ext Σ} :
+Lemma eta_expand_context_sorts {cf} {Σ} {Σg : global_env_ext_map} {Δ Γ Γ' cunivs} {wfΣ : Typing.wf_ext Σ} :
   repr_decls Σg Σ ->
-  sorts_local_ctx (lift_typing typing) Σ ctx ctx' cunivs ->
-  expanded_context Σ (repeat 0 #|ctx|) (eta_context Σg #|ctx| ctx').
+  sorts_local_ctx (lift_typing3 typing) Σ Δ Γ Γ' cunivs ->
+  expanded_context Σ (repeat 0 #|Γ|) (eta_context Σg #|Γ| Γ').
 Proof.
   intros hrepr hs. constructor.
   eapply All_fold_fold_context_k_defs. cbn. len.
-  induction ctx' in hs, cunivs |- *; cbn; auto.
+  induction Γ' in hs, cunivs |- *; cbn; auto.
   constructor; eauto.
   cbn in hs. destruct a as [na [b|] ty]; try destruct hs as [hs ?].
-  specialize (IHctx' cunivs hs). constructor; auto.
+  specialize (IHΓ' cunivs hs). constructor; auto.
   constructor. len. rewrite repeat_app.
   destruct l as [Htm [s Hs]].
-  epose proof (eta_expand_expanded (Σ := Σ) _ (repeat None (#|ctx'| + #|ctx|)) _ _ wfΣ Htm).
+  epose proof (eta_expand_expanded (Σ := Σ) _ _ (repeat None (#|Γ'| + #|Γ|)) _ _ wfΣ Htm).
   forward H.
   clear. rewrite -app_context_length.
   induction (_ ,,, _); cbn; constructor; auto.
@@ -1480,14 +1481,14 @@ Proof.
   constructor; eauto. constructor.
 Qed.
 
-Lemma eta_context_length g n ctx : #|eta_context g n ctx| = #|ctx|.
+Lemma eta_context_length g n Γ : #|eta_context g n Γ| = #|Γ|.
 Proof. now rewrite /eta_context; len. Qed.
 #[export] Hint Rewrite @eta_context_length : len.
 
 Lemma eta_expand_global_decl_expanded {cf : checker_flags} (Σ : global_env_ext) (Σg : global_env_ext_map) kn d :
   repr_decls Σg Σ ->
   Typing.wf_ext Σ ->
-  on_global_decl cumul_gen (lift_typing typing) Σ kn d ->
+  on_global_decl cumul_gen (lift_typing3 typing) Σ kn d ->
   expanded_decl Σ (eta_global_declaration Σg d).
 Proof.
   intros hrepr wf ond.
@@ -1495,13 +1496,13 @@ Proof.
   - unfold on_constant_decl in ond.
     destruct c as [na body ty rel]; cbn in *.
     destruct body. constructor => //; cbn.
-    apply (eta_expand_expanded (Σ := Σ) [] [] t0 na wf ond.1). constructor.
+    apply (eta_expand_expanded (Σ := Σ) [] [] [] t0 na wf ond.1). constructor.
     apply hrepr.
     destruct ond as [s Hs]. constructor => //.
   - destruct ond as [onI onP onN onV].
     constructor. cbn.
     eapply eta_expand_context => //.
-    solve_all. cbn. eapply All_map, Alli_All; tea => n idecl oni.
+    solve_all. cbn. apply All_Forall. eapply All_map, Alli_All; tea => n idecl oni.
     constructor.
     cbn. solve_all.
     pose proof oni.(onConstructors).
@@ -1512,7 +1513,7 @@ Proof.
     eapply eta_expand_context_sorts in X0. now len in X0. exact hrepr.
     len. len.
     pose proof onc.(on_ctype). destruct X0 as (_ & s & t0 & _).
-    epose proof (eta_expand_expanded (Σ := Σ) _ (repeat None #|ind_bodies m|) _ _ wf t0).
+    epose proof (eta_expand_expanded (Σ := Σ) _ _ (repeat None #|ind_bodies m|) _ _ wf t0).
     forward H. rewrite -arities_context_length.
     clear. induction (arities_context _); constructor; auto.
     specialize (H _ hrepr).
