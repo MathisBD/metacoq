@@ -142,21 +142,19 @@ Module Environment (T : Term).
   (** ** Declarations *)
   Notation context_decl := (context_decl term).
 
-  (** Local (de Bruijn) variable binding *)
+  (** Local variable binding *)
 
   Definition vass x A : context_decl :=
     {| decl_name := x ; decl_body := None ; decl_type := A |}.
 
-  (** Local (de Bruijn) let-binding *)
+  (** Local let-binding *)
 
   Definition vdef x t A : context_decl :=
     {| decl_name := x ; decl_body := Some t ; decl_type := A |}.
 
-  (** Local (de Bruijn) context *)
+  (** Local (de Bruijn) context. Last declarations are stored first. *)
 
   Definition context := list context_decl.
-
-  (** Last declaration first *)
 
   Definition lift_decl n k d := (map_decl (lift n k) d).
 
@@ -319,7 +317,7 @@ Module Environment (T : Term).
       As an invariant, declarations in the named context should not 
       contain unbound [tRel]s (but can contain [tVar]s). *)
   Definition named_context := list (ident * context_decl).
-
+  
   (** *** Environments *)
 
   Record constructor_body := {

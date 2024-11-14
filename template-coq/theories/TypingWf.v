@@ -17,11 +17,29 @@ Existing Class wf.
   and the global context.
 *)
 
-Lemma All_local_env_wf_decl Σ :
-  forall (Γ : context),
-    All (wf_decl Σ) Γ -> All_local_env (wf_decl_pred Σ) Γ.
+Lemma All_named_env_wf_decl Σ :
+  forall (Δ : named_context),
+    All (wf_decl Σ) (List.map snd Δ) -> All_named_env (wf_decl_pred Σ) Δ.
 Proof.
-  intros Γ X.
+  intros Δ X. induction Δ.
+  - constructor.
+  - destruct a as [id [na [b|] t]] ; constructor.
+    + apply IHΔ. now inv X.
+    + inv X. auto.
+    + apply IHΔ. now inv X. 
+    + inv X. auto.
+Qed. 
+
+Lemma All_named_env_wf_decls Σ Δ :
+  All_named_env (wf_decl_pred Σ) Δ -> All (wf_decl Σ) (List.map snd Δ).
+Proof.
+  induction 1; constructor; auto.
+Qed.
+
+Lemma All_local_env_wf_decl Σ Δ Γ :
+    All (wf_decl Σ) Γ -> All_local_env (wf_decl_pred Σ Δ) Γ.
+Proof.
+  intros X.
   induction Γ in X |- *.
   - constructor; eauto.
   - destruct a as [na [body|] ty].
@@ -35,9 +53,16 @@ Proof.
         apply X0.
 Qed.
 
+Lemma All_local_env_wf_decls Σ Δ Γ :
+  All_local_env (wf_decl_pred Σ Δ) Γ -> All (wf_decl Σ) Γ.
+Proof.
+  induction 1; constructor; auto.
+Qed.
+
+
 (* Still needed ? *)
-Lemma on_global_decl_impl `{checker_flags} Σ P Q kn d :
-  (forall Σ Γ j, on_global_env cumul_gen P Σ.1 -> P Σ Γ j -> Q Σ Γ j) ->
+Lemma on_global_decl_impl `{checker_flags} Σ (Δ : named_context) P Q kn d :
+  (forall Σ Δ Γ j, on_global_env cumul_gen P Σ.1 -> P Σ Δ Γ j -> Q Σ Δ Γ j) ->
   on_global_env cumul_gen P Σ.1 ->
   on_global_decl cumul_gen P Σ kn d -> on_global_decl cumul_gen Q Σ kn d.
 Proof.
@@ -46,8 +71,8 @@ Proof.
   apply HPQ.
 Qed.
 
-Lemma on_global_env_impl `{checker_flags} Σ P Q :
-  (forall Σ Γ j, on_global_env cumul_gen P Σ.1 -> P Σ Γ j -> Q Σ Γ j) ->
+Lemma on_global_env_impl `{checker_flags} Σ (Δ : named_context) P Q :
+  (forall Σ Δ Γ j, on_global_env cumul_gen P Σ.1 -> P Σ Δ Γ j -> Q Σ Δ Γ j) ->
   on_global_env cumul_gen P Σ -> on_global_env cumul_gen Q Σ.
 Proof.
   destruct Σ as [univs Σ]; cbn.
@@ -57,9 +82,16 @@ Proof.
   eapply on_global_decl_impl; tea. split => //.
 Qed.
 
-Lemma All_local_env_wf_decl_inv Σ (a : context_decl) (Γ : list context_decl)
-         (X : All_local_env (wf_decl_pred Σ) (a :: Γ)) :
-    on_local_decl (wf_decl_pred Σ) Γ a * All_local_env (wf_decl_pred Σ) Γ.
+Lemma All_named_env_wf_decl_inv Σ id (d : context_decl) (Δ : named_context) 
+         (X : All_named_env (wf_decl_pred Σ) ((id, d) :: Δ)) :
+    on_local_decl (wf_decl_pred Σ Δ) [] d * All_named_env (wf_decl_pred Σ) Δ.
+Proof.
+  inv X; intuition; red; simpl; eauto.
+Qed.
+
+Lemma All_local_env_wf_decl_inv Σ (Δ : named_context) (a : context_decl) (Γ : list context_decl)
+         (X : All_local_env (wf_decl_pred Σ Δ) (a :: Γ)) :
+    on_local_decl (wf_decl_pred Σ Δ) Γ a * All_local_env (wf_decl_pred Σ Δ) Γ.
 Proof.
   inv X; intuition; red; simpl; eauto.
 Qed.
@@ -95,8 +127,8 @@ Proof.
   unfold cofix_subst. generalize #|mfix|; intros. induction n; auto.
 Qed.
 
-Lemma red1_isLambda Σ Γ t u :
-  red1 Σ Γ t u -> isLambda t -> isLambda u.
+Lemma red1_isLambda Σ Δ Γ t u :
+  red1 Σ Δ Γ t u -> isLambda t -> isLambda u.
 Proof.
   induction 1 using red1_ind_all; simpl; try discriminate; auto.
 Qed.
@@ -264,9 +296,9 @@ Proof.
   solve_all. eapply wf_decl_extends; tea; typeclasses eauto.
 Qed.
 
-Lemma sorts_local_ctx_All_wf_decl {cf:checker_flags} {Σ} {mdecl} {u: list sort} {args} :
-  sorts_local_ctx (fun Σ : global_env_ext => wf_decl_pred Σ) Σ
-    (arities_context (ind_bodies mdecl),,, ind_params mdecl)
+Lemma sorts_local_ctx_All_wf_decl {cf:checker_flags} {Σ Δ} {mdecl} {u: list sort} {args} :
+  sorts_local_ctx wf_decl_pred Σ Δ
+    (arities_context (ind_bodies mdecl) ,,, ind_params mdecl)
     args u ->
   All (wf_decl Σ) args.
 Proof.
@@ -296,13 +328,6 @@ Proof.
   apply on_cargs in X0.
   eapply sorts_local_ctx_All_wf_decl in X0.
   solve_all. eapply wf_decl_extends; tea; typeclasses eauto.
-Qed.
-
-Lemma All_local_env_wf_decls Σ ctx :
-  TemplateEnvTyping.All_local_env (wf_decl_pred Σ) ctx ->
-  All (wf_decl Σ) ctx.
-Proof.
-  induction 1; constructor; auto.
 Qed.
 
 Lemma on_global_inductive_wf_params {cf:checker_flags} {Σ : global_env_ext} {kn mdecl} :
@@ -492,8 +517,8 @@ Section WfAst.
     now apply wf_extended_subst.
   Qed.
 
-  Lemma lift_typing_wf_pred Σ' Γ j :
-    lift_typing (fun Σ _ t T => WfAst.wf Σ t * WfAst.wf Σ T) Σ' Γ j -> wf_decl_pred Σ' Γ j.
+  Lemma lift_typing2_wf_pred Σ' Δ j :
+    lift_typing2 (fun Σ _ t T => WfAst.wf Σ t * WfAst.wf Σ T) Σ' Δ j -> wf_decl_pred Σ' Δ [] j.
   Proof.
     intros (Xtm & s & (Xty & _) & _).
     split; tas.
@@ -501,23 +526,32 @@ Section WfAst.
     now destruct Xtm.
   Qed.
 
-  Lemma lift_typing2_wf_pred P Γ j :
-    lift_typing_conj P (fun _ t T => WfAst.wf Σ t * WfAst.wf Σ T) Γ j -> wf_decl_pred Σ Γ j.
+  Lemma lift_typing3_wf_pred Σ' Δ Γ j :
+    lift_typing3 (fun Σ _ _ t T => WfAst.wf Σ t * WfAst.wf Σ T) Σ' Δ Γ j -> wf_decl_pred Σ' Δ Γ j.
+  Proof.
+    intros (Xtm & s & (Xty & _) & _).
+    split; tas.
+    destruct j_term => //.
+    now destruct Xtm.
+  Qed.
+
+  (*Lemma lift_typing3_wf_pred P Γ Δ j :
+    lift_typing_conj P (fun _ t T => WfAst.wf Σ t * WfAst.wf Σ T) Γ j -> wf_decl_pred Σ Δ Γ j.
   Proof.
     intro H.
     eapply lift_typing_wf_pred.
-    apply lift_typing_impl with (1 := H).
+    eapply lift_typing_impl. with (2 := H).
     move => ??[]//.
-  Qed.
+  Qed.*)
 
   Lemma Forall_decls_on_global_wf :
     Forall_decls_typing
-      (fun (Σ : global_env_ext) (_ : context) (t T : term) =>
+      (fun (Σ : global_env_ext) (_ : named_context) (_ : context) (t T : term) =>
       WfAst.wf Σ t * WfAst.wf Σ T) Σ ->
     on_global_env cumul_gen wf_decl_pred Σ.
   Proof using Type.
-    apply on_global_env_impl; intros ??? _.
-    apply lift_typing_wf_pred.
+    apply on_global_env_impl. exact []. intros ???? _.
+    apply lift_typing3_wf_pred.
   Qed.
 
   (* Hint Resolve on_global_wf_Forall_decls : wf. *)
@@ -726,15 +760,16 @@ Section WfRed.
   Context {cf:checker_flags}.
   Context {Σ : global_env}.
 
-  Lemma wf_red1 Γ M N :
+  Lemma wf_red1 Δ Γ M N :
     on_global_env cumul_gen wf_decl_pred Σ ->
+    All (wf_decl Σ) (List.map snd Δ) ->
     All (wf_decl Σ) Γ ->
     WfAst.wf Σ M ->
-    red1 Σ Γ M N ->
+    red1 Σ Δ Γ M N ->
     WfAst.wf Σ N.
   Proof using Type.
-    intros wfΣ wfΓ wfM H.
-    induction H using red1_ind_all in wfM, wfΓ |- *.
+    intros wfΣ wfΔ wfΓ wfM H.
+    induction H using red1_ind_all in wfM, wfΔ, wfΓ |- *.
     all: inv wfM.
     all: try solve[ constructor; intuition auto with wf ].
     all:auto.
@@ -746,6 +781,11 @@ Section WfRed.
       unfold option_map in H. destruct nth_error eqn:Heq; try discriminate.
       eapply nth_error_all in wfΓ; eauto. unfold wf_decl in *.
       apply some_inj in H; rewrite H in wfΓ; apply wfΓ.
+    - induction Δ ; [discriminate|].
+      destruct a as [id' d']. simpl in H. destruct (eqb_specT id id').
+      + simpl in wfΔ, H. apply some_inj in H. inv wfΔ.
+        unfold wf_decl in X. rewrite H in X. simpl in X. exact X.1.
+      + apply IHΔ ; [|assumption]. now inv wfΔ.
     - unfold iota_red.
       eapply wf_mkApps_inv in X2.
       apply wf_subst. eapply All_rev. now eapply All_skipn.
@@ -790,7 +830,8 @@ Section WfRed.
       eapply OnOne2All_All2_All2; tea. cbn. intuition auto.
       now rewrite b0 in a1.
       apply b2 => //.
-      apply All_app_inv => //.
+      + apply All_map => //. 
+      + apply All_app_inv => //.
     - now eapply wf_mkApps.
     - constructor; auto. induction X; auto; congruence.
       clear H X0 H0. induction X; inv X1; constructor; intuition auto; try congruence.
@@ -805,7 +846,8 @@ Section WfRed.
       simpl in *.
       inversion e. subst. clear e.
       intuition eauto.
-      eapply ih. 2: assumption.
+      eapply ih. 3: assumption.
+      apply All_map => //.
       solve_all.
       apply All_app_inv. 2: assumption.
       unfold fix_context. apply All_rev. eapply All_mapi.
@@ -822,7 +864,8 @@ Section WfRed.
       simpl in *.
       inversion e. subst. clear e.
       intuition eauto.
-      eapply ih. 2: assumption.
+      eapply ih. 3: assumption.
+      apply All_map => //.
       solve_all. apply All_app_inv. 2: assumption.
       unfold fix_context. apply All_rev. eapply All_mapi.
       eapply All_Alli. 1: exact H'.
@@ -880,10 +923,10 @@ Section WfRed.
     all: intuition eauto using wf_extends with typeclass_instances.
   Qed.
 
-  Lemma wf_it_mkProd_or_LetIn_inv (Σ' : global_env_ext) Γ (wfΓ : wf_local Σ' Γ)
-    : All_local_env_over (typing Σ')
-    (fun (Γ : context) (_ : wf_local Σ' Γ)
-      (t T : term) (_ : Σ';;; Γ |- t : T) => WfAst.wf Σ' t * WfAst.wf Σ' T)
+  Lemma wf_it_mkProd_or_LetIn_inv (Σ' : global_env_ext) Δ Γ (wfΓ : wf_local Σ' Δ Γ)
+    : All_local_env_over (typing Σ' Δ)
+    (fun (Γ : context) (_ : wf_local Σ' Δ Γ)
+      (t T : term) (_ : Σ' ;;; Δ ;;; Γ |- t : T) => WfAst.wf Σ' t * WfAst.wf Σ' T)
           Γ wfΓ
   -> forall t, WfAst.wf Σ' t -> WfAst.wf Σ' (it_mkProd_or_LetIn Γ t).
   Proof using Type.
@@ -946,21 +989,36 @@ Section TypingWf.
 
   Lemma typing_wf_gen :
     env_prop
-      (fun Σ Γ t T => WfAst.wf Σ t * WfAst.wf Σ T)
-      (fun Σ Γ j => wf_decl_pred Σ Γ j)
-      (fun Σ Γ wfΓ => All (wf_decl Σ) Γ).
+      (fun Σ Δ Γ t T => WfAst.wf Σ t * WfAst.wf Σ T)
+      (fun Σ Δ Γ j => wf_decl_pred Σ Δ Γ j)
+      (fun Σ Δ wfΔ => All (wf_decl Σ) (List.map snd Δ))
+      (fun Σ Δ wfΔ Γ wfΓ => All (wf_decl Σ) Γ).
   Proof using Type.
     apply typing_ind_env; intros; auto with wf;
       specialize_goal; unfold wf_decl_pred in *;
       try solve [split; try constructor; intuition auto with wf].
 
-    - now eapply lift_typing2_wf_pred.
-    - apply All_local_env_over_2 in X.
-      eapply All_local_env_wf_decls.
-      eapply All_local_env_impl with (1 := X) => Γ' j.
-      apply lift_typing2_wf_pred.
+    - unshelve eapply (lift_typing3_wf_pred Σ Δ Γ).
+      unfold lift_typing_conj1 in X.
+      apply (lift_sorting_impl X) ; intuition.
+    - apply All_named_env_over_2 in X.
+      apply All_named_env_wf_decls. 
+      eapply All_named_env_impl with (1 := X) => Δ' Γ' j H.
+      eapply lift_typing3_wf_pred.
+      apply (lift_sorting_impl H) ; intuition.
+    - apply All_local_env_over_2 in X1.
+      apply All_local_env_wf_decls with Δ.
+      eapply All_local_env_impl with (1 := X1) => Γ' j H.
+      eapply lift_typing3_wf_pred. unfold lift_typing_conj1 in H.
+      apply (lift_sorting_impl H) ; intuition.
     - split; wf. apply wf_lift.
-      apply (nth_error_all H X).
+      apply (nth_error_all H X0).
+    - split ; wf. clear X0 wfΓ wfΔ.
+      induction Δ in H, X |- * ; [discriminate|].
+      destruct a as [id' d']. simpl in H. destruct (eqb_specT id id').
+      + subst. apply some_inj in H.
+        subst. inv X. unfold wf_decl in X0. intuition.
+      + apply IHΔ ; [assumption|]. now inv X.
     - split. constructor; auto. wf.
       clear -X1.
       induction X1; constructor; now auto.
@@ -981,12 +1039,12 @@ Section TypingWf.
       apply wf_subst_instance.
       eapply declared_constructor_wf; eauto.
 
-    - destruct X3 as [wfret wps].
-      destruct X6 as [wfc wfapps].
+    - destruct X4 as [wfret wps].
+      destruct X7 as [wfc wfapps].
       eapply wf_mkApps_inv in wfapps.
       eapply All_app in wfapps as [wfp wfindices].
       assert (All (wf_decl Σ) predctx).
-      { now apply All_app in X4 as [? ?]. }
+      { now apply All_app in X5 as [? ?]. }
       split; [econstructor; simpl; eauto; solve_all|].
       eapply All2i_All2; tea; repeat intuition auto.
       apply wf_mkApps. subst ptm. wf. apply wf_it_mkLambda_or_LetIn; auto.
@@ -1001,20 +1059,20 @@ Section TypingWf.
       split.
       + constructor.
         solve_all; destruct a0, b; cbn in *; assumption.
-      + eapply All_nth_error in X1 as []; eauto.
+      + eapply All_nth_error in X2 as []; eauto.
 
     - subst types.
       split.
       + constructor.
         solve_all; destruct a0, b; cbn in *; assumption.
-      + eapply All_nth_error in X1 as []; eauto.
+      + eapply All_nth_error in X2 as []; eauto.
 
     - split => //.
       + constructor; intuition auto. solve_all.
       + constructor => //. constructor => //. constructor; intuition auto.
   Qed.
 
-  Lemma typing_all_wf_decl Σ (wfΣ : wf Σ.1) Γ (wfΓ : wf_local Σ Γ) :
+  Lemma typing_all_wf_decl Σ (wfΣ : wf Σ.1) Δ (wfΔ : wf_named Σ Δ) Γ (wfΓ : wf_local Σ Δ Γ) :
     All (wf_decl Σ.1) Γ.
   Proof using Type.
     eapply (env_prop_wf_local typing_wf_gen); eauto.
@@ -1027,8 +1085,8 @@ Section TypingWf.
     eapply (env_prop_sigma typing_wf_gen _ wfΣ).
   Qed.
 
-  Lemma typing_wf Σ (wfΣ : wf Σ.1) Γ t T :
-    Σ ;;; Γ |- t : T -> WfAst.wf Σ.1 t * WfAst.wf Σ.1 T.
+  Lemma typing_wf Σ (wfΣ : wf Σ.1) Δ Γ t T :
+    Σ ;;; Δ ;;; Γ |- t : T -> WfAst.wf Σ.1 t * WfAst.wf Σ.1 T.
   Proof using Type.
     intros. eapply typing_wf_gen in X; intuition eauto with wf.
   Qed.
@@ -1039,7 +1097,7 @@ Section TypingWf.
     All (@wf_inductive_body Σ) (ind_bodies mdecl).
   Proof using Type.
     intros declm.
-    pose proof (typing_wf_gen (Env.empty_ext Σ) wfΣ _ localenv_nil _ _ (type_Prop _)) as [X _].
+    pose proof (typing_wf_gen (Env.empty_ext Σ) wfΣ _ _ _ _ (type_Prop _)) as [X _].
     eapply lookup_global_Some_iff_In_NoDup in declm; eauto.
     2: destruct X; now eapply NoDup_on_global_decls.
     destruct (lookup_on_global_env X declm) as [? [? [ext ?]]]; eauto.

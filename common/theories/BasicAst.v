@@ -417,7 +417,7 @@ Qed.
 Section Contexts.
   Context {term term' term'' : Type}.
   Notation context term := (list (context_decl term)).
-
+  
   Lemma test_decl_impl (f g : term -> bool) x : (forall x, f x -> g x) ->
     test_decl f x -> test_decl g x.
   Proof using Type.
@@ -556,7 +556,6 @@ Section Contexts.
   Proof using Type.
     now apply_funelim (fold_context f Γ); intros; simpl; auto; f_equal.
   Qed.
-
 
   Lemma fold_context_In_spec (f : context term -> context_decl term -> context_decl term) (ctx : context term) :
     fold_context_In ctx (fun n (x : context_decl term) (_ : In x ctx) => f n x) =

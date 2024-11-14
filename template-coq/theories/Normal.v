@@ -5,7 +5,7 @@ From MetaCoq.Template Require Import Ast Typing.
 
 
 Section Normal.
-  Context (Σ : global_env).
+  Context (Σ : global_env) (Δ : named_context).
 
   Inductive normal (Γ : context) : term -> Prop :=
   | nf_ne t : neutral Γ t -> normal Γ t
@@ -25,7 +25,9 @@ Section Normal.
        | ne_rel i :
            option_map decl_body (nth_error Γ i) = Some None ->
            neutral Γ (tRel i)
-       | ne_var v : neutral Γ (tVar v)
+       | ne_var v : 
+           option_map decl_body (nctx_lookup Δ v) = Some None ->
+           neutral Γ (tVar v)
        | ne_evar n l : neutral Γ (tEvar n l)
        | ne_const c u decl :
            lookup_env Σ c = Some (ConstantDecl decl) -> decl.(cst_body) = None ->
@@ -51,7 +53,9 @@ Section Normal.
   | whne_rel i :
       option_map decl_body (nth_error Γ i) = Some None ->
       whne Γ (tRel i)
-  | whne_var v : whne Γ (tVar v)
+  | whne_var v : 
+      option_map decl_body (nctx_lookup Δ v) = Some None ->
+      whne Γ (tVar v)
   | whne_evar n l : whne Γ (tEvar n l)
   | whne_const c u decl :
       lookup_env Σ c = Some (ConstantDecl decl) -> decl.(cst_body) = None ->

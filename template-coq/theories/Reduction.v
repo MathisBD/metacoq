@@ -7,21 +7,21 @@ From MetaCoq.Template Require Import Ast AstUtils WfAst Induction LiftSubst
 From Equations Require Import Equations.
 Require Import ssreflect.
 
-Lemma red1_tApp_mkApps_l Σ Γ M1 N1 M2 :
-red1 Σ Γ M1 N1 -> red1 Σ Γ (tApp M1 M2) (mkApps N1 M2).
+Lemma red1_tApp_mkApps_l Σ Δ Γ M1 N1 M2 :
+red1 Σ Δ Γ M1 N1 -> red1 Σ Δ Γ (tApp M1 M2) (mkApps N1 M2).
 Proof. constructor. auto. Qed.
 
-Lemma red1_tApp_mkApp Σ Γ M1 N1 M2 :
-  red1 Σ Γ M1 N1 -> red1 Σ Γ (tApp M1 [M2]) (mkApp N1 M2).
+Lemma red1_tApp_mkApp Σ Δ Γ M1 N1 M2 :
+  red1 Σ Δ Γ M1 N1 -> red1 Σ Δ Γ (tApp M1 [M2]) (mkApp N1 M2).
 Proof.
   intros.
   change (mkApp N1 M2) with (mkApps N1 [M2]).
   apply app_red_l. auto.
 Qed.
 
-Lemma red1_mkApp Σ Γ M1 N1 M2 :
+Lemma red1_mkApp Σ Δ Γ M1 N1 M2 :
   WfAst.wf Σ M1 ->
-  red1 Σ Γ M1 N1 -> red1 Σ Γ (mkApp M1 M2) (mkApp N1 M2).
+  red1 Σ Δ Γ M1 N1 -> red1 Σ Δ Γ (mkApp M1 M2) (mkApp N1 M2).
 Proof.
   intros wfM1 H.
   destruct (isApp M1) eqn:Heq.
@@ -47,9 +47,9 @@ Proof.
   now apply red1_tApp_mkApp.
 Qed.
 
-Lemma red1_mkApps_l Σ Γ M1 N1 M2 :
+Lemma red1_mkApps_l Σ Δ Γ M1 N1 M2 :
   WfAst.wf Σ M1 -> All (WfAst.wf Σ) M2 ->
-  red1 Σ Γ M1 N1 -> red1 Σ Γ (mkApps M1 M2) (mkApps N1 M2).
+  red1 Σ Δ Γ M1 N1 -> red1 Σ Δ Γ (mkApps M1 M2) (mkApps N1 M2).
 Proof.
   induction M2 in M1, N1 |- *. simpl; auto.
   intros. specialize (IHM2 (mkApp M1 a) (mkApp N1 a)).
@@ -61,9 +61,9 @@ Proof.
   apply red1_mkApp; auto.
 Qed.
 
-Lemma red1_mkApps_r Σ Γ M1 M2 N2 :
+Lemma red1_mkApps_r Σ Δ Γ M1 M2 N2 :
   WfAst.wf Σ M1 -> All (WfAst.wf Σ) M2 ->
-  OnOne2 (red1 Σ Γ) M2 N2 -> red1 Σ Γ (mkApps M1 M2) (mkApps M1 N2).
+  OnOne2 (red1 Σ Δ Γ) M2 N2 -> red1 Σ Δ Γ (mkApps M1 M2) (mkApps M1 N2).
 Proof.
   intros. induction X1 in M1, X, X0 |- *.
   inv X0.

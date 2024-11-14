@@ -190,8 +190,8 @@ Qed.
 
 Definition wf_decl Σ d := option_default (wf Σ) (decl_body d) unit × wf Σ (decl_type d).
 
-Definition wf_decl_pred Σ : context -> judgment -> Type :=
-  (fun _ j => option_default (wf Σ) (j_term j) unit × wf Σ (j_typ j)).
+Definition wf_decl_pred Σ : named_context -> context -> judgment -> Type :=
+  (fun _ _ j => option_default (wf Σ) (j_term j) unit × wf Σ (j_typ j)).
 
 Lemma wf_mkApp Σ u a : wf Σ u -> wf Σ a -> wf Σ (mkApp u a).
 Proof.
