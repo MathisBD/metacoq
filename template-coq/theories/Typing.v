@@ -1189,16 +1189,13 @@ Proof.
   all: try lia.
 Qed.
 
-Lemma wf_named_inv `{checker_flags} {Σ Δ' id} (w : wf_named Σ Δ') :
-  forall d Δ,
-    Δ' = (id, d) :: Δ ->
-    ∑ (w' : wf_named Σ Δ) u,
-      { ty : lift_typing0 (typing Σ Δ []) (Judge d.(decl_body) d.(decl_type) (Some u)) |
-            All_named_env_size (@typing_size _ Σ) _ w' <
-            All_named_env_size (@typing_size _ Σ) _ w /\
-            lift_typing_size (@typing_size _ Σ Δ []) _ ty <= All_named_env_size (@typing_size _ _) _ w }.
+Lemma wf_named_inv `{checker_flags} {Σ Δ id d} (w : wf_named Σ (Δ ,, (id, d))) :
+  ∑ (w' : wf_named Σ Δ) u,
+    { ty : lift_typing0 (typing Σ Δ []) (Judge d.(decl_body) d.(decl_type) (Some u)) |
+          All_named_env_size (@typing_size _ Σ) _ w' <
+          All_named_env_size (@typing_size _ Σ) _ w /\
+          lift_typing_size (@typing_size _ Σ Δ []) _ ty <= All_named_env_size (@typing_size _ _) _ w }.
 Proof.
-  intros d Δ ->.
   depelim w; cbn.
   all: exists w, l.2.π1, (lift_sorting_extract l).
   all: pose proof (typing_size_pos l.2.π2.1).
@@ -1452,7 +1449,7 @@ Proof.
   intros Xj XΔ XΓ Xrel Xvar Xsort Xcast Xprod Xlam Xlet Xapp Xconst Xind Xctor Xcase Xproj Xfix Xcofix Xint Xfloat Xstring Xarr Xconv.
   intros Σ wfΣ Δ Γ t T H.
   (* NOTE (Danil): while porting to 8.9, I had to split original "pose" into 2 pieces,
-   otherwise it takes forever to execure the "pose", for some reason *)
+   otherwise it takes forever to execute the "pose", for some reason *)
   pose (@Fix_F ({ Σ : global_env_ext & { wfΣ : wf Σ & { Δ & { Γ & { t & { T & Σ ;;; Δ ;;; Γ |- t : T }}}}}})) as p0.
   specialize (p0 (lexprod (precompose lt (fun Σ => globenv_size (fst Σ)))
         (fun Σ => precompose lt (fun x => typing_size x.π2.π2.π2.π2.π2)))) as p.
@@ -1543,6 +1540,7 @@ Proof.
       forward IH.
       constructor 2. simpl. apply H0.
       intuition. }
+    clear IH.
 
     assert (Xj' : forall Δ Γ j (Hj : lift_typing3 typing Σ Δ Γ j),
         lift_typing_size (fun t T H => @typing_size cf Σ Δ Γ t T H) _ Hj < typing_size H ->
@@ -1554,72 +1552,66 @@ Proof.
       apply X1 with (Hty := Hty). set (size_mid := lift_typing_size _ _ Hj) in *. lia. }
     clear Xj; rename Xj' into Xj.
 
-    assert (forall Γ' t T (Hty : Σ ;;; Δ ;;; Γ' |- t : T),
-      typing_size Hty <= typing_size H ->
-      PΔ Σ Δ (typing_wf_named Hty)) as X3.
-    { intros. apply XΔ ; tea. admit. admit. }
-    
-    assert (forall Γ' t T (Hty : Σ ;;; Δ ;;; Γ' |- t : T),
-      typing_size Hty <= typing_size H ->
-      PΓ Σ Δ (typing_wf_named Hty) Γ' (typing_wf_local Hty)) as X2.
-    { (*intros.
-      clear - wfΣ X1 Xj XΓ.
-      apply XΓ ; tas.
-      - (*pose proof (typing_wf_named_size Hty) as H1.*)
-        set (w := typing_wf_named Hty) in *. clearbody w.
-        induction w ; [constructor|constructor|constructor].
-        + apply IHw with Hty.   *) 
-      
-     admit. 
-    }
-    (*{ intros.
-      pose proof (typing_wf_local_size Hty) as Hlt0.
-      pose proof (typing_wf_named_size Hty) as Hlt1.
-      set (foo := typing_wf_local Hty) in *.
-      set (bar := typing_wf_named Hty) in *.
-      assert (foo = typing_wf_local Hty) as Hfoo by auto.
-      assert (bar = typing_wf_named Hty) as Hbar by auto. 
-      assert (All_local_env_size (@typing_size cf Σ Δ) Γ' foo < typing_size H) as Hlt_foo by lia.
-      assert (All_named_env_size (@typing_size cf Σ) Δ bar < typing_size H) as Hlt_bar by lia.
-      clear - wfΣ X14 Xj Hbar Hfoo Hlt_bar Hlt_foo XΓ.
-      apply XΓ; tas.  
-    + admit.
-    + admit. 
-    (*+ revert bar Hlt_bar Hlt1 Eqn_bar.
-      induction bar; simpl in *; cbn in *; constructor.
-      - simpl in *. apply wf_named_inv in H. apply IHbar with (H) (Hty). ; tea.
-        4: apply typing_wf_local_size.
-        3: unfold bar. eapply (@typing_wf_named_size cf Σ Δ.
-        * lia.
-      - red. apply (X14 _ _ _ t2.2.π2.1). cbn. lia.
+    assert (forall Δ' Γ' t T (Hty : Σ ;;; Δ' ;;; Γ' |- t : T),
+            typing_size Hty <= typing_size H ->
+            PΔ Σ Δ' (typing_wf_named Hty)) as X3.
+    { intros.
+      pose proof (typing_wf_named_size Hty) as Hlt0.
+      set (foo := typing_wf_named Hty) in *. clearbody foo. 
+      assert (All_named_env_size (@typing_size cf Σ) Δ' foo < typing_size H) as Hlt by lia.
+      clear -wfΣ X1 Xj Hlt XΔ.
+      apply XΔ; tas. 
+    + revert foo Hlt. induction foo; cbn in *; constructor.
       - simpl in *. apply IHfoo. lia.
-      - red. apply (X14 _ _ _ t2.1). cbn. lia.
-      - red. apply (X14 _ _ _ t2.2.π2.1). cbn. lia.
-    + revert foo Hlt.
+      - apply (X1 _ _ _ _ t2.2.π2.1). cbn. lia.
+      - simpl in *. apply IHfoo. lia.
+      - apply (X1 _ _ _ _ t2.1). cbn. lia.
+      - apply (X1 _ _ _ _ t2.2.π2.1). cbn. lia.
+    + revert foo Hlt. induction foo; cbn in *; constructor.
+      1,3: apply IHfoo; lia.
+      all: eapply Xj with (Hj := t2); simpl; cbn.
+      all: lia. }
+    
+    assert (forall Δ' Γ' t T (Hty : Σ ;;; Δ' ;;; Γ' |- t : T),
+      typing_size Hty <= typing_size H ->
+      PΓ Σ Δ' (typing_wf_named Hty) Γ' (typing_wf_local Hty)) as X2.
+    { intros.
+      pose proof (typing_wf_local_size Hty) as Hlt'.
+      set (foo := typing_wf_local Hty) in *. clearbody foo. 
+      assert (All_local_env_size (@typing_size cf Σ Δ') Γ' foo < typing_size H) as Hlt0 by lia.
+      
+      pose proof (typing_wf_named_size Hty) as Hlt''.
+      set (bar := typing_wf_named Hty) in *. clearbody bar. 
+      assert (All_named_env_size (@typing_size cf Σ) Δ' bar < typing_size H) as Hlt1 by lia.
+      
+      clear -wfΣ X1 Xj Hlt0 Hlt1 XΓ.
+      
+      apply XΓ; tas.
+    + clear foo Hlt0. revert bar Hlt1. induction bar; cbn in *; constructor.
+      - simpl in *. apply IHbar. lia.
+      - apply (X1 _ _ _ _ t2.2.π2.1). cbn. lia.
+      - simpl in *. apply IHbar. lia.
+      - apply (X1 _ _ _ _ t2.1). cbn. lia.
+      - apply (X1 _ _ _ _ t2.2.π2.1). cbn. lia.
+    + clear foo Hlt0. revert bar Hlt1. induction bar; cbn in *; constructor.
+      1,3: apply IHbar; lia.
+      all: eapply Xj with (Hj := t2); simpl; cbn.
+      all: lia.
+    + revert foo Hlt0.
+      induction foo; simpl in *; cbn in * ; constructor.
+      - simpl in *. eapply IHfoo. lia.
+      - red. apply (X1 _ _ _ _ t2.2.π2.1). cbn. lia.
+      - simpl in *. apply IHfoo. lia.
+      - red. apply (X1 _ _ _ _ t2.1). cbn. lia.
+      - red. apply (X1 _ _ _ _ t2.2.π2.1). cbn. lia.
+    + revert foo Hlt0.
       induction foo; cbn in *; constructor.
       1,3: apply IHfoo; lia.
       all: eapply Xj with (Hj := t2); simpl; cbn.
-      all: lia.*)
-    + revert foo Hfoo Hlt_foo.
-      induction foo; simpl in *; cbn in *; constructor.
-      - simpl in *. eapply IHfoo ; eauto. 3: lia. admit. admit.
-      - red. apply (X14 _ _ _ _ t3.2.π2.1). cbn. lia.
-      - simpl in *. eapply IHfoo ; eauto. 3: lia. admit. admit.
-      - red. apply (X14 _ _ _ _ t3.1). cbn. lia.
-      - red. apply (X14 _ _ _ _ t3.2.π2.1). cbn. lia.
-    + revert foo Hfoo Hlt_foo.
-      induction foo; cbn in *; constructor.
-      - eapply IHfoo ; eauto. 3: lia. admit. admit.
-      - admit. 
-      - admit.
-      - admit. 
-      (*1,3: eapply IHfoo; eauto ; lia.
-      all: eapply Xj with (Hj := t2); simpl; cbn.
-      all: lia.*) }*)
-
-    clear IH.
+      all: lia. }
+    
     assert (pΓ : PΓ Σ Δ (typing_wf_named H) Γ (typing_wf_local H)).
-    { apply (X2 _ _ _ H). lia. }
+    { apply (X2 _ _ _ _ H). lia. }
     split; auto.
     set (wfΓ := typing_wf_local H); clearbody wfΓ.
 
@@ -1703,7 +1695,7 @@ Proof.
         * eapply IHctxi. intros. eapply (IH _ _ _ Hty). simpl. lia.
         * eapply IHctxi. intros. eapply (IH _ _ _ Hty). simpl. lia.
         ++ simpl in X1. simpl in pΓ. auto. eapply (X1 _ _ _ _ H); eauto. simpl; auto with arith.
-      ++ eapply (X2 _ _ _ H); eauto. simpl. subst predctx. lia.
+      ++ eapply (X2 _ _ _ _ H); eauto. simpl. subst predctx. lia.
       ++ eapply (X1 _ _ _ _ H0); simpl. lia.
       ++ clear X3 X2 Xj. revert a X1. clear. intros.
          subst ptm predctx.
@@ -1725,7 +1717,7 @@ Proof.
       eapply Xproj; eauto; clear Xproj.
       ++specialize (X1 [] [] _ _ (type_Prop _)). apply X1. 
         rewrite typing_size_Prop. simpl. generalize (typing_size_pos H). lia.
-      ++simpl in X1. admit.
+      ++simpl in X1. eapply X1. auto with arith. 
       
     --clear p0 Xrel Xvar Xsort Xcast Xprod Xlam Xlet Xapp Xconst Xind Xctor Xcase Xproj Xcofix Xint Xfloat Xstring Xarr Xconv.
       eapply Xfix; eauto; clear Xfix.
