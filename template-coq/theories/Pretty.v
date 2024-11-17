@@ -1,3 +1,7 @@
+(** This module defines pretty-printers for template-coq terms,
+    declarations and environments. It relies the PPrint pretty-printing 
+    library : to print a document to a string, use [pp_string] or [pp_bytestring]. *)
+
 From Coq Require Import PrimString Uint63.
 From MetaCoq.Template Require Import Ast.
 From MetaCoq.Utils Require Import utils.
@@ -16,14 +20,15 @@ Record t := mk
     cf_universes : bool 
   ; (** Should we print evar instances ? *)
     cf_evar_instances : bool 
-  ; (** Should we print relevance information ? *)
-    cf_relevance : bool 
   ; (** Should we print match predicates ? *)
     cf_match_preds : bool
   ; (** Should we print all parentheses ? *) 
     cf_parentheses : bool 
   ; (** Should we print full kernel names ? *)
-    cf_full_names : bool }.
+    cf_full_names : bool 
+  ; (** Should we print the bodies of definition and inductives ?
+        (only relevant when printing declarations) *)
+    cf_full_defs : bool }.
 
 (** Don't print any low-level details. *)
 Definition none : t := mk false false false false false false.
@@ -35,10 +40,10 @@ Definition all : t := mk true true true true true true.
 Definition with_universes (cf : t) : t :=
   {| cf_universes := true 
   ;  cf_evar_instances := cf.(cf_evar_instances)
-  ;  cf_relevance := cf.(cf_relevance)
   ;  cf_match_preds := cf.(cf_match_preds) 
   ;  cf_parentheses := cf.(cf_parentheses)
-  ;  cf_full_names := cf.(cf_full_names) |}.
+  ;  cf_full_names := cf.(cf_full_names) 
+  ;  cf_full_defs := cf.(cf_full_defs) |}.
   
 End Config.
 
@@ -65,11 +70,17 @@ Definition pstring_of_sbtring (bstr : bstring) : pstring :=
 
 (** Convert a primitive string to a byte string. *)
 Definition bstring_of_pstring (pstr : pstring) : bstring :=
-  string_of_list char63_to_string (PrimStringAxioms.to_list pstr).
+  let chars := List.map char63_to_string (PrimStringAxioms.to_list pstr) in 
+  List.fold_left (fun s s' => s ^ s') chars ""%bs.
 
 (** [bstr s] builds an atomic document containing the bytestring [s]. *)
 Definition bstr {A} (s : bstring) : doc A :=
   str $ pstring_of_sbtring s.
+
+(** [pp_bytestring] is analogous to [pp_string] except it outputs a bytestring
+    instead of a primitive string. *)
+Definition pp_bytestring {A} width (d : doc A) : bstring :=
+  bstring_of_pstring $ pp_string width d.
 
 (** Name handling. *)
 
@@ -87,13 +98,13 @@ Definition is_fresh (ctx : list ident) (id : ident) :=
 (** [name_for_type t] chooses a generic name for a variable of type [t]. *)
 Fixpoint name_for_type (t : term) : bstring :=
   match t with
-  | tRel _ | tVar _ | tEvar _ _ => "H"%bs
-  | tSort _ => "X"%bs
-  | tProd _ _ _ => "f"%bs
+  | tRel _ | tVar _ | tEvar _ _ => "x"%bs
+  | tSort _ => "H"%bs
+  | tProd _ _ _ => "P"%bs
   | tLambda _ _ _ => "f"%bs
   | tLetIn _ _ _ t' => name_for_type t'
   | tApp f _ => name_for_type f
-  | tConst _ _ => "x"%bs
+  | tConst _ _ => "c"%bs
   | tInd ind u =>
     match lookup_inductive env ind with
     | Some (_, body) => String.substring 0 1 (body.(ind_name))
@@ -162,18 +173,16 @@ Context (config : Config.t).
 Section Env.
 Context (env : global_env_ext).
 
-(** [paren_if top d] adds parentheses around document [d] if [top] is equal to [false].
+(** [paren_if min_prec prec d] adds parentheses around document [d] if [min_prec > prec].
     It takes into account the configuration option to force parentheses. *)
-Definition paren_if {A} (top : bool) (d : doc A) : doc A :=
-  if Config.cf_parentheses config || negb top then paren d else d.
+Definition paren_if {A} (min_prec prec : nat) (d : doc A) : doc A :=
+  if Config.cf_parentheses config || Nat.ltb prec min_prec then paren d else d.
   
 Definition print_name (n : name) : doc unit :=
   match n with 
   | nAnon => str "_"
   | nNamed n => bstr n
   end. 
-
-About Instance.t.
 
 (** Print a kernel name. This is not so simple : 
     - the configuration options might require us to print the full name.
@@ -194,16 +203,23 @@ Definition print_kername (kname : kername) : doc unit :=
   let path := modpath_ids modpath [] in 
   if Config.cf_full_names config then 
     (* If the config option is set, print the full module path. *)
-    flow_map (str ".") bstr $ path ++ [label]
-  else if String.length label <=? 1 then 
+    separate_map (str ".") bstr $ path ++ [label]
+  else if String.length label <=? 2 then 
     (* If the label is very short, print the last part of the modpath + the label. *)
     match List.last (List.map Some path) None with 
-    | Some prefix => flow_map (str ".") bstr $ [prefix ; label]
+    | Some prefix => bstr prefix ^^ str "." ^^ bstr label
     | None => bstr label 
     end
   else 
     (* Otherwise print only the identifier *)
     bstr label.
+
+Definition print_cast_kind (kind : cast_kind) : doc unit :=
+  match kind with 
+  | Cast => str ":"
+  | VmCast => str "<:"
+  | NativeCast => str "<<:"
+  end.
 
 Definition print_level (l : Level.t) : doc unit :=
   match l with 
@@ -246,7 +262,7 @@ Definition print_univ_instance (uinst : Instance.t) : doc unit :=
   else 
     empty.
 
-(** Print the names bound by a universe declaration, but _not_ the constraints. *)
+(** Prints the names bound by a universe declaration, but _not_ the constraints. *)
 Definition print_univ_decl (decl : universes_decl) : doc unit :=
   match decl with 
   | Monomorphic_ctx => empty 
@@ -266,10 +282,8 @@ Definition print_def {A} (on_ty : A -> doc unit) (on_body : A -> doc unit) (def 
   let body_doc := on_body def.(dbody) in 
   (* We don't [align] here on purpose. *)
   group $ group (n_doc ^//^ ty_doc) ^//^ body_doc.
-         
-  
 
-(** Helper function to print a single term of the form [tFix mfix n] or [tCoFix mfix n].
+(** Helper function to print a term of the form [tFix mfix n] or [tCoFix mfix n].
     The parameter [is_fix] controls whether to print a fixpoint or a co-fixpoint. *)
 Definition print_fixpoint (on_term : list ident -> term -> doc unit) (ctx : list ident) 
   (defs : mfixpoint term) (n : nat) (is_fix : bool) : doc unit  :=
@@ -295,60 +309,89 @@ Definition print_branch (on_term : list ident -> term -> doc unit) (ctx : list i
   let binder := flow_map (break 2) bstr (ctor.(cstr_name) :: var_names) in
   group $ align $ binder ^+^ str "⇒" ^//^ on_term branch_ctx branch.(bbody).
 
-Fixpoint print_term (top : bool) (ctx : list ident) (t : term) {struct t} : doc unit :=
+(** Get the precedence of a term. Higher precedences bind tighter : 
+    for instance application has the highest precedence.  *)
+Definition term_prec (t : term) : nat :=
+  match t with  
+  | tCase _ _ _ _ => 10
+  | tLambda _ _ _ => 10
+  | tLetIn _ _ _ body => 10
+  | tProd _ _ body => 
+    if noccur_between 0 1 body then 50 else 10
+  | tFix _ _ => 10
+  | tCoFix _ _ => 10
+  | tCast _ _ _ => 20
+  | tProj _ _ => 100
+  | tApp _ _ => 100
+  | _ => 0
+  end.
+
+(** [print_term_prec min_prec ctx t] pretty-prints the term [t].
+    - [ctx] contains the names of bound variables (tRels) in [t]. 
+      Innermost variables are stored at the head of the list. 
+    - [min_prec] is the minimum precedence required to print [t] without parentheses.
+      If [term_prec t >= min_prec] than [t] is printed without parentheses,
+      otherwise parentheses are added as needed. Initially [min_prec] is set to [0]. *)
+Fixpoint print_term_prec (min_prec : nat) (ctx : list ident) (t : term) : doc unit :=
+  let prec := term_prec t in
   match t with
   | tRel n =>
     match List.nth_error ctx n with
     | Some id => bstr id
-    | None => str "UnboundRel(" ^^ nat10 n ^^ str ")"
+    | None => str "#unbound_rel(" ^^ nat10 n ^^ str ")"
     end
-  | tVar n => str "Var(" ^^ bstr n ^^ str ")"
+  | tVar n => bstr n
   | tEvar ev args => 
     if Config.cf_evar_instances config then 
-      let args_doc := flow_map (str ";" ^^ break 0) (print_term true ctx) args in
-      str "Evar(" ^^ nat10 ev ^^ bracket "[" args_doc "]" ^^ str ")"
+      let args_doc := flow_map (str ";" ^^ break 0) (print_term_prec 0 ctx) args in
+      str "#evar(" ^^ nat10 ev ^^ bracket "[" args_doc "]" ^^ str ")"
     else 
-      str "Evar(" ^^ nat10 ev ^^ str ")"
+      str "#evar(" ^^ nat10 ev ^^ str ")"
   | tSort s => print_sort s
-  | tCast c _ t => 
-    let contents := print_term true ctx c ^//^ (str ":"  ^+^ print_term true ctx t) in
-    paren_if top $ align $ group contents
+  | tCast c kind t =>
+    let contents := 
+      print_term_prec (S prec) ctx c ^+^ 
+      print_cast_kind kind ^//^ 
+      print_term_prec (S prec) ctx t
+    in
+    paren_if min_prec prec $ align $ group contents
   | tProd n ty body =>
     let n := fresh_name ctx $ base_name env n.(binder_name) (Some ty) in
     let contents :=
       (* Decide whether this is a dependent or non-dependent product. *)
       if noccur_between 0 1 body
-      then [print_term false ctx ty ^+^ str "→" ; print_term true (n :: ctx) body]
+      then [print_term_prec (S prec) ctx ty ^+^ str "→" ; print_term_prec prec (n :: ctx) body]
       else [str "∀" ^+^ bstr n ^+^ str ":" ; 
-            print_term false ctx ty ^^ str "," ; 
-            print_term true (n :: ctx) body]
+            print_term_prec 0 ctx ty ^^ str "," ; 
+            print_term_prec prec (n :: ctx) body]
     in 
-    paren_if top $ align $ flow (break 2) contents
+    paren_if min_prec prec $ align $ flow (break 2) contents
   | tLambda n ty body =>
     let n := fresh_name ctx $ base_name env n.(binder_name) (Some ty) in
     let contents :=
       [str "fun" ^+^ bstr n ^+^ str ":" ; 
-       print_term true ctx ty ^+^ str "⇒" ; 
-       print_term true (n :: ctx) body]
+       print_term_prec 0 ctx ty ^+^ str "⇒" ; 
+       print_term_prec prec (n :: ctx) body]
     in 
-    paren_if top $ align $ flow (break 2) contents
+    paren_if min_prec prec $ align $ flow (break 2) contents
   | tLetIn n def ty body =>
     let n := fresh_name ctx $ base_name env n.(binder_name) (Some ty) in
     let n_doc := str "let" ^+^ bstr n ^+^ str ":" in
-    let ty_doc := print_term true ctx ty ^+^ str ":=" in
-    let def_doc := print_term true ctx def in
-    let body_doc := print_term true (n :: ctx) body in
+    let ty_doc := print_term_prec 0 ctx ty ^+^ str ":=" in
+    let def_doc := print_term_prec 0 ctx def in
+    let body_doc := print_term_prec prec (n :: ctx) body in
     (* Getting the formatting correct is a bit tricky. *)
     let line := group $ group (n_doc ^//^ ty_doc) ^//^ def_doc ^/^ str "in" in 
-    align $ group $ line ^/^ body_doc
+    paren_if min_prec prec $ align $ group $ line ^/^ body_doc
   | tApp f args =>
-    paren_if top $ align $ flow_map (break 2) (print_term false ctx) (f :: args) 
+    let contents := print_term_prec prec ctx f :: List.map (print_term_prec (S prec) ctx) args in 
+    paren_if min_prec prec $ align $ flow (break 2) contents 
   | tConst kname uinst => print_kername kname ^^ print_univ_instance uinst
   | tInd ind uinst =>
     let name := 
       match lookup_inductive env ind with
-      | Some (_, body) => bstr body.(ind_name)
-      | None => bracket "UnboundInd(" (bstr $ string_of_inductive ind) ")"
+      | Some (_, body) => print_kername (ind.(inductive_mind).1, body.(ind_name))
+      | None => bracket "#unbound_ind(" (bstr $ string_of_inductive ind) ")"
       end
     in 
     name ^^ print_univ_instance uinst
@@ -357,7 +400,7 @@ Fixpoint print_term (top : bool) (ctx : list ident) (t : term) {struct t} : doc 
       match lookup_constructor env ind idx with
       | Some (_, body) => bstr body.(cstr_name)
       | None =>
-        str "UnboundCtor(" ^^ (bstr $ string_of_constructor ind idx) ^^ str ")"
+        str "#unbound_ctor(" ^^ (bstr $ string_of_constructor ind idx) ^^ str ")"
       end
     in
     name ^^ print_univ_instance uinst
@@ -365,10 +408,10 @@ Fixpoint print_term (top : bool) (ctx : list ident) (t : term) {struct t} : doc 
     match lookup_inductive env ci.(ci_ind) with
     | Some (_, body) =>
         (* Print each branch separately. *)
-        let branch_docs := map2 (print_branch (print_term true) ctx) branches body.(ind_ctors) in
+        let branch_docs := map2 (print_branch (print_term_prec 0) ctx) branches body.(ind_ctors) in
         (* Part 1 is [match x with]. *)
         let part1 := 
-          group $ str "match" ^+^ print_term true ctx x ^/^ str "with"
+          group $ str "match" ^+^ print_term_prec 0 ctx x ^/^ str "with"
         in
         (* Part 2 is [C1 => ... | C2 => ... | C3 => ... end]*)
         let part2 := 
@@ -377,16 +420,17 @@ Fixpoint print_term (top : bool) (ctx : list ident) (t : term) {struct t} : doc 
             ; separate (break 0 ^^ str "|" ^^ space) branch_docs
             ; break 0 ^^ str "end" ]
         in
-        paren_if top $ align $ part1 ^^ part2
-    | None => str "CASE_ERROR"
+        paren_if min_prec prec $ align $ part1 ^^ part2
+    | None => str "#case_error"
     end
-  | tFix mfix n => paren_if top $ print_fixpoint (print_term true) ctx mfix n true 
-  | tCoFix mfix n => paren_if top $ print_fixpoint (print_term true) ctx mfix n false
+  | tFix mfix n => paren_if min_prec prec $ print_fixpoint (print_term_prec 0) ctx mfix n true 
+  | tCoFix mfix n => paren_if min_prec prec $ print_fixpoint (print_term_prec 0) ctx mfix n false
   | tProj p t =>
     match lookup_projection env p with
     | Some (_, _, _, pbody) => 
+      (* Projections never need parentheses. *)
       group $ align $ concat 
-        [ print_term false ctx t
+        [ print_term_prec (S prec) ctx t
         ; ifflat empty (hardline ^^ blank 2) 
         ; str ".(" ^^ bstr pbody.(proj_name) ^^ str ")" ]
     | None =>
@@ -394,29 +438,21 @@ Fixpoint print_term (top : bool) (ctx : list ident) (t : term) {struct t} : doc 
         [ bstr (string_of_inductive p.(proj_ind)) 
         ; nat10 p.(proj_npars)
         ; nat10 p.(proj_arg) 
-        ; print_term true ctx t ]
+        ; print_term_prec 0 ctx t ]
       in
-      bracket "UnboundProj(" (flow (str "," ^^ break 0) contents) ")"
+      bracket "#unbound_proj(" (flow (str "," ^^ break 0) contents) ")"
     end 
-  | tInt i => str "Int(" ^^ bstr (string_of_prim_int i) ^^ str ")"
-  | tFloat f => str "Float(" ^^ bstr (string_of_float f) ^^ str ")"
-  | tString s => str "String(" ^^ str s ^^ str ")"
+  | tInt i => str "#int(" ^^ bstr (string_of_prim_int i) ^^ str ")"
+  | tFloat f => str "#float(" ^^ bstr (string_of_float f) ^^ str ")"
+  | tString s => str "#string(" ^^ str s ^^ str ")"
   | tArray u arr def ty => 
-    let arr_doc := bracket "[" (flow_map (space ^^ str ";" ^^ break 0) (print_term true ctx) arr) "]" in 
-    let contents := [print_level u ; arr_doc ; print_term true ctx def ; print_term true ctx ty] in
-    bracket "Array(" (flow (str "," ^^ break 0) contents) ")"
+    let arr_doc := bracket "[" (flow_map (space ^^ str ";" ^^ break 0) (print_term_prec 0 ctx) arr) "]" in 
+    let contents := [print_level u ; arr_doc ; print_term_prec 0 ctx def ; print_term_prec 0 ctx ty] in
+    bracket "#array(" (flow (str "," ^^ break 0) contents) ")"
   end.
 
-(*Definition test : TemplateMonad unit :=
-  mlet (env, t) <- tmQuoteRec 
-    (fix add (n m : nat) {struct n} : nat :=
-    match n with
-    | 0 => m
-    | S p => S (add p m)
-    end) ;;
-  let output := pp_string 80 $ print_term Config.basic (empty_ext env) true [] t in
-  tmPrint =<< tmEval cbv output.
-MetaCoq Run test.*)
+(** [print_term ctx t] pretty-prints the term [t] in context [ctx]. *)
+Definition print_term ctx t : doc unit := print_term_prec 0 ctx t.
 
 (** [print_context_decl ctx decl] pretty-prints the context declaration [decl] in named context [ctx]. *)
 Definition print_context_decl (ctx : list ident) (decl : context_decl) : doc unit :=
@@ -424,11 +460,11 @@ Definition print_context_decl (ctx : list ident) (decl : context_decl) : doc uni
     match decl.(decl_body) with
     | None => 
       [ print_name decl.(decl_name).(binder_name) 
-      ; str ":" ^+^ print_term true ctx decl.(decl_type)]
+      ; str ":" ^+^ print_term ctx decl.(decl_type)]
     | Some body => 
         [ print_name decl.(decl_name).(binder_name) 
-        ; str ":" ^+^ print_term true ctx decl.(decl_type)
-        ; str ":=" ^+^ print_term true ctx body ]
+        ; str ":" ^+^ print_term ctx decl.(decl_type)
+        ; str ":=" ^+^ print_term ctx body ]
     end
   in 
   group $ paren $ flow (break 2) contents.
@@ -478,13 +514,13 @@ Definition print_one_cstr (ctx : list ident) (ind : inductive) (params : list te
     mkApps (tInd ind []) $ 
     (List.map (lift0 n_args) params) ++ ctor.(cstr_indices) 
   in
-  align $ group $ bstr ctor.(cstr_name) ^+^ str ":" ^//^ print_term true ctx ctor_ty.
+  align $ group $ bstr ctor.(cstr_name) ^+^ str ":" ^//^ print_term ctx ctor_ty.
 
 (** Helper function to print a single inductive.
     - [header] is the keyword which should be printed before the inductive name 
       (usually it is [Inductive] or [with]).
     - [ctx] should contain the names of the other inductives in the block. *)
-Definition print_one_ind (header : doc unit) (short : bool) (ctx : list ident) 
+Definition print_one_ind (header : doc unit) (ctx : list ident) 
   (mbody : mutual_inductive_body) (body : one_inductive_body) (ind : inductive) : doc unit :=
   let '(ctx_params, param_docs) := print_context ctx mbody.(ind_params) in
   let params := List.rev (mapi (fun i _ => tRel i) mbody.(ind_params)) in
@@ -492,10 +528,10 @@ Definition print_one_ind (header : doc unit) (short : bool) (ctx : list ident)
   (* part1 is [ind_name@{univs} params : arity :=]*)
   let part1 := flow (break 2) $ 
     header ::
-    (bstr body.(ind_name) ^^ print_univ_decl (snd env)) ::
+    (print_kername (ind.(inductive_mind).1, body.(ind_name)) ^^ print_univ_decl (snd env)) ::
     List.rev param_docs ++
     [ str ":"
-    ; print_term true ctx_params arity
+    ; print_term ctx_params arity
     ; str ":=" ]
   in 
   (* part2 is [C1 : ... | C2 : ... | C2 : ...] *)
@@ -503,34 +539,29 @@ Definition print_one_ind (header : doc unit) (short : bool) (ctx : list ident)
     ifflat empty (str "|" ^^ space) ^^
     separate_map (break 0 ^^ str "|" ^^ space) (print_one_cstr ctx_params ind params) body.(ind_ctors)
   in
-  align $ flow (break 0) [part1 ; if short then str "..." else part2].
-
-(*Definition print_one_cstr_entry Γ (mie : mutual_inductive_entry) (c : ident × term) : t :=
-  c.1 ^ " : " ^ print_term Γ true c.2.
-
-Definition print_one_ind_entry (short : bool) Γ (mie : mutual_inductive_entry) (oie : one_inductive_entry) : t :=
-  let '(Γpars, spars) := print_context Γ mie.(mind_entry_params) in
-  oie.(mind_entry_typename) ^ spars ^ print_term Γpars true oie.(mind_entry_arity) ^ ":=" ^ nl ^
-  if short then "..."
-  else print_list (print_one_cstr_entry Γpars mie) nl (combine oie.(mind_entry_consnames) oie.(mind_entry_lc)).*)
+  align $ flow (break 0) [part1 ; if Config.cf_full_defs config then part2 else str "..."].
 
 End Env.
 
 (** Print a mutual inductive block. *)
-Definition print_mutual_inductive (env : global_env) (short : bool) (ind_kname : kername) 
-  (mbody : mutual_inductive_body) : doc unit :=
+Definition print_mutual_inductive (env : global_env) (ind_kname : kername) (mbody : mutual_inductive_body) : doc unit :=
   let ext_env := (env, mbody.(ind_universes)) in
-  let ctx := push_context ext_env (arities_context mbody.(ind_bodies)) [] in
-  align $ group $ 
-    separate (break 0) $ mapi 
+  let ind_ctx := 
+    map 
+      (fun body => pp_bytestring 0 $ print_kername (ind_kname.1, body.(ind_name)))
+      mbody.(ind_bodies)
+  in
+  let contents := 
+    mapi 
       (fun i body => 
         let header := if i == 0 then print_recursivity_kind mbody.(ind_finite) else str "with" in
-        print_one_ind ext_env header short ctx mbody body (mkInd ind_kname i))
-      mbody.(ind_bodies).
+        print_one_ind ext_env header ind_ctx mbody body (mkInd ind_kname i))
+      mbody.(ind_bodies) 
+  in
+  align $ group $ separate (break 0) contents.
   
 (** Print a constant. *)
-Definition print_constant (env : global_env) (short : bool) (kname : kername) 
-  (cst : constant_body) : doc unit :=
+Definition print_constant (env : global_env) (kname : kername) (cst : constant_body) : doc unit :=
   let ext_env := (env, cst.(cst_universes)) in
   let ctx := [] in
   let header := 
@@ -539,28 +570,31 @@ Definition print_constant (env : global_env) (short : bool) (kname : kername)
     | None => str "Axiom" 
     end
   in
-  let body :=
-    if short then group $ str ":=" ^/^ str "..." else 
-    match cst.(cst_body) with 
-    | Some body => group $ str ":=" ^/^ print_term ext_env true ctx body
-    | None => empty 
-    end
+  let decl := 
+    flow (break 2)
+      [ header ; (print_kername kname ^^ print_univ_decl cst.(cst_universes))
+      ; str ":" ; print_term ext_env ctx cst.(cst_type) ]
   in
-  align $ flow (break 2)
-    [ header ; (print_kername kname ^^ print_univ_decl cst.(cst_universes))
-    ; str ":" ; print_term ext_env true ctx cst.(cst_type) 
-    ; body ].
+  let body :=
+    if Config.cf_full_defs config then  
+      match cst.(cst_body) with 
+      | Some body => print_term ext_env ctx body
+      | None => empty
+      end
+    else str "..."
+  in
+  align $ group $ decl ^+^ str ":=" ^//^ body.
   
 (** Print all the declarations in a global environment. *)
-Definition print_env (env : global_env) (short : bool) : doc unit :=
+Definition print_env (env : global_env) : doc unit :=
   let fix loop decls acc :=
     match decls with 
-    | [] => separate (hardline ^^ if short then empty else hardline) acc
+    | [] => separate (hardline ^^ if Config.cf_full_defs config then hardline else empty) acc
     | (kname, decl) :: decls =>
       let doc := 
         match decl with 
-        | ConstantDecl cst => print_constant env short kname cst 
-        | InductiveDecl mbody => print_mutual_inductive env short kname mbody
+        | ConstantDecl cst => print_constant env kname cst 
+        | InductiveDecl mbody => print_mutual_inductive env kname mbody
         end
       in 
       loop decls (doc :: acc)
@@ -573,34 +607,8 @@ End Printing.
 (**********)
 (* Testing. *)
 
-(*From MetaCoq.Template Require Import TemplateMonad Loader.
+From MetaCoq.Template Require Import TemplateMonad Loader.
 Import MCMonadNotation.
-
-Definition test_env : TemplateMonad unit :=
-  mlet (env, _) <- tmQuoteRec term ;;
-  tmPrint =<< tmEval cbv $ 
-    pp_string 80 $ print_env Config.default env false.
-
-(* TODO : use precedences *)
-(* TODO : make [short] into a config option. maybe [skip_definitions] ?*)
-(* TODO : group lambdas and products together *)
-
-(*Definition test_ind : TemplateMonad unit :=
-  mlet (env, ind) <- tmQuoteRec Even ;;
-  mlet ind <- 
-    match ind with 
-    | tInd ind _ => ret ind 
-    | _ => tmFail "not an inductive"%bs
-    end
-  ;;
-  mlet (mbody, body) <- 
-    match lookup_inductive env ind with
-    | Some res => ret res 
-    | None => tmFail "lookup_inductive failed"%bs
-    end
-  ;;
-  tmPrint =<< tmEval cbv $ pp_string 80 $ 
-    print_mutual_inductive (Config.with_universes Config.default) env false ind.(inductive_mind) mbody.*)
 
 Definition mydef (env : global_env) (inst : Instance.t) (short : bool) (kname : kername) 
   (cst : constant_body) : doc unit :=
@@ -608,19 +616,14 @@ Definition mydef (env : global_env) (inst : Instance.t) (short : bool) (kname : 
   let ctx : list ident := [] in 
   @empty unit. 
 
-Definition test_cst : TemplateMonad unit :=
-  mlet (env, cst) <- tmQuoteRec mydef ;;
-  mlet kname <- 
-    match cst with 
-    | tConst kname _ => ret kname 
-    | _ => tmFail "not a constant"%bs
-    end
-  ;;
-  mlet cst <- 
-    match lookup_constant env kname with
-    | Some res => ret res 
-    | None => tmFail "lookup_constant failed"%bs
-    end
-  ;;
-  tmPrint =<< tmEval cbv $ pp_string 80 $ 
-    print_constant (Config.all) env false kname cst.*)
+Notation "'$run' f" :=
+  ltac:(
+    let p y := exact y in
+    run_template_program f p
+  ) (at level 0, only parsing).
+
+Definition config := (Config.mk false false false false false true).
+Definition env := fst $ $run (tmQuoteRec mydef).
+Eval vm_compute in pp_string 80 $ print_env config env.
+
+(* TODO : print match return predicate. *)
