@@ -624,6 +624,6 @@ Notation "'$run' f" :=
 
 Definition config := (Config.mk false false false false false true).
 Definition env := fst $ $run (tmQuoteRec mydef).
-Eval vm_compute in pp_string 80 $ print_env config env.
+Time Eval vm_compute in pp_string 80 $ print_env config env.
 
 (* TODO : print match return predicate. *)
