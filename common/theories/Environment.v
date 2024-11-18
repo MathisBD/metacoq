@@ -307,7 +307,7 @@ Module Environment (T : Term).
   #[global] Hint Rewrite expand_lets_ctx_length : len.
 
   Definition fix_context (m : mfixpoint term) : context :=
-    List.rev (mapi (fun i d => vass d.(dname) (lift i 0 d.(dtype))) m).
+    rev (mapi (fun i d => vass d.(dname) (lift i 0 d.(dtype))) m).
 
   (** Named Contexts *)
 
@@ -986,7 +986,7 @@ Module Environment (T : Term).
     | {| decl_body := None |} :: Γ => tRel p :: reln_alt (p + 1) Γ
     end.
 
-  Lemma reln_alt_eq l Γ k : reln l k Γ = List.rev (reln_alt k Γ) ++ l.
+  Lemma reln_alt_eq l Γ k : reln l k Γ = rev (reln_alt k Γ) ++ l.
   Proof.
     induction Γ in l, k |- *; simpl; auto.
     destruct a as [na [body|] ty]; simpl.
@@ -1128,7 +1128,7 @@ Module Environment (T : Term).
     induction Γ as [|[? [] ?] ?]; simpl; auto.
   Qed.
 
-  Lemma context_assumptions_rev Γ : context_assumptions (List.rev Γ) = context_assumptions Γ.
+  Lemma context_assumptions_rev Γ : context_assumptions (rev Γ) = context_assumptions Γ.
   Proof using Type.
     induction Γ; simpl; auto. rewrite context_assumptions_app IHΓ /=.
     destruct (decl_body a); simpl; lia.

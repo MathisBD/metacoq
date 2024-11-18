@@ -403,7 +403,6 @@ Fixpoint eq_term `{checker_flags} (φ : universes_graph) (t u : term) {struct t}
   | _, _ => false
   end.
 
-
 Fixpoint leq_term `{checker_flags} (φ : universes_graph) (t u : term) {struct t} :=
   match t, u with
   | tRel n, tRel n' => Nat.eqb n n'
@@ -437,7 +436,7 @@ Fixpoint leq_term `{checker_flags} (φ : universes_graph) (t u : term) {struct t
 Section Conversion.
 
   Context `{checker_flags} (flags : RedFlags.t).
-  Context (Σ : global_env) (G : universes_graph)  (Δ : named_context).
+  Context (Σ : global_env) (G : universes_graph) (Δ : named_context).
 
   Definition nodelta_flags := RedFlags.mk true true true false true true.
 
@@ -488,7 +487,6 @@ Section Conversion.
     | Some b => b
     | None => false
     end.
-
 
   Fixpoint isconv (n : nat) (leq : conv_pb) (Γ : context)
            (t1 : term) (l1 : list term) (t2 : term) (l2 : list term) {struct n} : option bool :=
