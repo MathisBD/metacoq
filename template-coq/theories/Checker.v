@@ -365,10 +365,6 @@ Definition isCoFix c :=
   | _ => false
   end.
 
-Inductive conv_pb :=
-| Conv
-| Cumul.
-
 Definition eq_case_info (ci ci' : case_info) :=
   eq_inductive ci.(ci_ind) ci'.(ci_ind) && Nat.eqb ci.(ci_npar) ci'.(ci_npar). (* FIXME relevance check *)
 
