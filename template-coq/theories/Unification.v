@@ -130,7 +130,7 @@ Fixpoint subst_var (v : ident) (t u : term) : term :=
 
 (** [instantiate_evar ctx subs def] instantiates an evar. 
     - [ctx] is the named context of the evar. 
-    - [def] is the definition of the evar.
+    - [def] is the definition of the evar (also works with the conclusion of the evar).
     - [subs] is the list of terms which are substituted for the variables in [ctx].
     TODO : make this more efficient. *)
 Fixpoint instantiate_evar (ctx : named_context) (subs : list term) (def : term) : term :=
@@ -163,13 +163,14 @@ Fixpoint whd_evars (evm : EvarMap.t) (t : term) {struct t} : term :=
       whd_evars evm $ instantiate_evar ctx subs def 
     | _ => t 
     end 
-  | _ => t 
+  | t => t 
   end.
 
 (** * Unification errors. *)
 
 Inductive unif_error := 
   | NotSameHead : unif_error
+  | OccurCheck : evar -> term -> unif_error
   | UnivInconsistency : unif_error
   | InternalError : string -> unif_error.
 
@@ -307,6 +308,49 @@ Definition find_unique_var evm (id : ident) (ts : list term) :=
 Definition find_unique_rel evm (n : nat) (ts : list term) :=
   find_unique (fun t => whd_evars evm t == tRel n) ts.
 
+(** [evar_occurs evm ev t] checks if evar [ev] occurs in term [t]. *)
+Fixpoint evar_occurs (evm : EvarMap.t) (ev : evar) (t : term) : bool :=
+  match whd_evars evm t with 
+  | tEvar ev' _ => if ev == ev' then true else false 
+  | t => fold_term (fun acc subt => acc || evar_occurs evm ev subt) false t
+  end.
+
+(** [term_fvars evm t] computes the set of free variables (tVars) in the term [t]. *)
+Definition term_fvars (evm : EvarMap.t) (t : term) : IdentSet.t := 
+  let fix aux acc t :=
+    match whd_evars evm t with 
+    | tVar v => IdentSet.add v acc 
+    | t => fold_term aux acc t 
+    end 
+  in 
+  aux IdentSet.empty t.
+
+(** [has_free_var evm vars t] checks if [t] has a free variable which is in [vars]. *)
+Definition has_free_var (evm : EvarMap.t) (vars : list ident) (t : term) : bool :=
+  let fvars := term_fvars evm t in 
+  List.existsb (fun v => IdentSet.mem v fvars) vars.
+
+(** [remove_with_deps evm nctx pos] removes the declarations at positions [pos] in named context [nctx].
+    Declarations which depend on removed ones are removed as well. *)
+Definition remove_with_deps (evm : EvarMap.t) (nctx : named_context) (pos : list nat) : named_context :=
+  (* We process declarations in [nctx] from last to first (i.e. outermost to innermost).
+     - [i] is the index of the current declaration.
+     - [removed] contains the identifiers of the variables which were removed so far. *)
+  let fix loop i nctx removed :=
+    match nctx with
+    | [] => []
+    | (id, d) :: nctx =>
+      if List.existsb (eqb i) pos
+         || has_free_var evm removed d.(decl_type) 
+         || option_default (has_free_var evm removed) d.(decl_body) false
+      (* Remove [d]. *)
+      then loop (pred i) nctx (id :: removed)
+      (* Keep [d]. *)
+      else (id, d) :: loop (pred i) nctx removed
+    end
+  in
+  rev $ loop (pred #|nctx|) (rev nctx) [].
+
 Module Invert.
 
 (** We need a state-option monad in this section. *)
@@ -333,7 +377,7 @@ Definition msum {A} (mx my : M A) : M A :=
   (at level 85, right associativity).
    
 Local Definition fail {A} : M A := fun s => None.
-
+  
 Definition invert (evm : EvarMap.t) (map : EMap.t (list nat)) (nctx : named_context) 
   (ev0 : evar) (subs : list term) (args : list term) (t : term) : option (EMap.t (list nat) * term) :=
   let subs_args := subs ++ args in
@@ -375,13 +419,19 @@ Definition invert (evm : EvarMap.t) (map : EMap.t (list nat)) (nctx : named_cont
       (* Invert each argument. *)
       mlet args <- monad_map_i on_arg args ;;
       ret $ tEvar ev args
-	| _ =>
+	| t =>
       map_term_with_bindersM depth (fun _ depth => ret $ S depth) (invert_aux inside_evar) t
     end
   in
   invert_aux false 0 t map.
 
 End Invert.
+
+Section Algorithm.
+Context `{uf : unif_flags} `{cf : checker_flags} (φ : universes_graph) (Σ : global_env) (Δ : named_context).
+
+Implicit Types (pb : conv_pb) (Γ : context).
+Existing Instance default_fuel.
 
 (** [invert evm map nctx ev subs args t] inverts the equation [?ev[subst] args := t]
     (where [nctx] is the named context of the evar, thus #|nctx| = #|subs|).
@@ -401,41 +451,37 @@ End Invert.
     positions to prune), which [invert] extends as needed. *)
 Definition invert := Invert.invert.
 
-(** [term_fvars evm t] computes the set of free variables (tVars) in the term [t]. *)
-Definition term_fvars (evm : EvarMap.t) (t : term) : IdentSet.t := 
-  let fix aux acc t :=
-    match whd_evars evm t with 
-    | tVar v => IdentSet.add v acc 
-    | _ => fold_term_with_binders tt (fun _ _ => tt) (fun _ => aux) acc t 
+(** [invert_lambdas evm map nctx ev subst args body] computes the term 
+    [fun x1 : A1{subs}^-1 => ... => fun xn : An{subs}^-1 => body], where :
+    - [ev] is an evar with named context [nctx].
+    - [subs] is a suspended substitution compatible with [nctx] (thus #|subs| = #|nctx|).
+    - [args] = [x1 ... xn] are the arguments of the evar.
+    - [body] is a term with free de Bruijn indices (tRels) [0 ... n-1].
+    - Each [xi] has type [Ai].
+
+    See [invert] for an explanation of [map].
+*)
+Definition invert_lambdas (evm : EvarMap.t) (Γ : context) (map : EMap.t (list nat)) 
+  (nctx : named_context) (ev : evar) (subs args : list term) (body : term) : option (EMap.t (list nat) * term) :=
+  (* We process the arguments from last to first. *)
+  let fix loop acc args : option (EMap.t (list nat) * term) :=
+    match args with 
+    | [] => ret acc 
+    | arg :: args => 
+      (* TODO : remove [nf_evars] and add evar handling to the checker. *)
+      (* TODO : use retyping instead of full typing here. *)
+      mlet ty <-
+        match Checker.infer Σ φ Δ Γ (nf_evars evm arg) with 
+        | Checked ty => Some ty 
+        | TypeError _ => None
+        end
+      ;;
+      mlet '(map, ty) <- invert evm map nctx ev subs (rev args) ty ;;
+      let binder := {| binder_name := nAnon ; binder_relevance := Relevant |} in
+      loop (map, tLambda binder ty body) args
     end 
   in 
-  aux IdentSet.empty t.
-
-(** [has_free_var evm vars t] checks if [t] has a free variable which is in [vars]. *)
-Definition has_free_var (evm : EvarMap.t) (vars : list ident) (t : term) : bool :=
-  let fvars := term_fvars evm t in 
-  List.existsb (fun v => IdentSet.mem v fvars) vars.
-
-(** [remove_with_deps evm nctx pos] removes the declarations at positions [pos] in named context [nctx].
-    Declarations which depend on removed ones are removed as well. *)
-Definition remove_with_deps (evm : EvarMap.t) (nctx : named_context) (pos : list nat) : named_context :=
-  (* We process declarations in [nctx] from last to first (i.e. outermost to innermost).
-     - [i] is the index of the current declaration.
-     - [removed] contains the identifiers of the variables which were removed so far. *)
-  let fix loop i nctx removed :=
-    match nctx with
-    | [] => []
-    | (id, d) :: nctx =>
-      if List.existsb (eqb i) pos
-         || has_free_var evm removed d.(decl_type) 
-         || option_default (has_free_var evm removed) d.(decl_body) false
-      (* Remove [d]. *)
-      then loop (pred i) nctx (id :: removed)
-      (* Keep [d]. *)
-      else (id, d) :: loop (pred i) nctx removed
-    end
-  in
-  rev $ loop (pred #|nctx|) (rev nctx) [].
+  loop (map, body) $ rev args.
       
 (** [prune evm ev pos] prunes the declarations at positions [pos] in the context of the evar [ev].
     More precisely :
@@ -464,11 +510,6 @@ Fixpoint prune (evm : EvarMap.t) (ev : nat) (pos : list nat) {struct ev} : optio
     Unfortunately for technical reasons we have to pass a useless [tt] argument to [prune_all]. *)
 with prune_all (evm : EvarMap.t) (map : EMap.t (list nat)) (dummy : unit) {struct dummy} : option EvarMap.t :=
   monad_fold_left (fun evm '(ev, pos) => prune evm ev pos) (EMap.elements map) evm. 
-
-Section Algorithm.
-Context `{uf : unif_flags} `{cf : checker_flags} (φ : universes_graph) (Σ : global_env) (Δ : named_context).
-
-Implicit Types (pb : conv_pb) (Γ : context).
 
 (** [intersect evm xs ys] computes the list of positions where the terms in [xs] and [ys] 
     are not equal. By default only disagreements on positions where both are variables 
@@ -506,6 +547,21 @@ Definition meta_same evm (ev : evar) (subs1 subs2 : list term) : unif_result Eva
   | None => UnifError NotSameHead
   end.
 
+(** Helper function used to implement [meta_inst]. 
+    It inverts the equation [ev[subs] args =?= t] and returns :
+    - the updated evar map (after pruning).
+    - the term [t'] that [ev] will get instantiated with, which lives in the local context of [ev]. *)
+Definition meta_inst_solution Γ (ev : evar) (subs args : list term) (t : term) evm :=
+  (* TODO : remove equal tails. *)
+  (* TODO : beta-reduce to remove dependencies. *)
+  mlet entry <- EvarMap.lookup evm ev ;;
+  mlet '(map, t0) <- invert evm (EMap.empty (list nat)) entry.(ev_nctx) ev subs args t ;;
+  mlet '(map, t1) <- invert_lambdas evm Γ map entry.(ev_nctx) ev subs args t0 ;;
+  (* Prune the evar map as required by [map]. *)
+  mlet evm <- prune_all evm map tt ;;
+  (* TODO : refresh universes. *)
+  ret (evm, t1).
+
 (** Main unification function. *)
 Fixpoint unify pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
   if is_evar evm t || is_evar evm t'
@@ -527,37 +583,46 @@ with try_instantiate pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
         then (ev', ev, subs', subs, t, t')
         else (ev, ev', subs, subs', t', t)
       in 
-      meta_inst pb Γ ev1 subs1 t1 evm <|> 
-      meta_inst pb Γ ev2 subs2 t2 evm
+      meta_inst pb Γ ev1 subs1 [] t1 evm <|> 
+      meta_inst pb Γ ev2 subs2 [] t2 evm
   (* Meta-InstL *)
-  | tEvar ev subs, t0 => meta_inst pb Γ ev subs t0 evm
+  | tEvar ev subs, t0 => meta_inst pb Γ ev subs [] t0 evm
   (* Meta-InstR *)
-  | t0, tEvar ev subs => meta_inst pb Γ ev subs t0 evm
+  | t0, tEvar ev subs => meta_inst pb Γ ev subs [] t0 evm
   | _, _ => UnifError (InternalError "try_instantiate : expected an evar")
   end
 
-(** [meta_inst pb Γ ev subs t evm] implements the Meta-Inst rule to instantiate [ev[subs] := t]. *)
-with meta_inst pb Γ ev subs t evm {struct pb} : unif_result EvarMap.t :=
+(** [meta_inst pb Γ ev subs t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t]. *)
+with meta_inst pb Γ ev subs args t evm {struct pb} : unif_result EvarMap.t :=
   let is_var t := 
     match t with tVar _ | tRel _ => true | _ => false end 
   in
   (* Check the substitution and arguments contain only variables (tVars and tRels). *)
   if List.forallb is_var (subs ++ args) then 
-    
+    (* Compute the solution [sol]. *)
+    let* (evm, sol) := lift_option $ meta_inst_solution Γ ev subs args t evm in
+    (* Unify the type of the evar with the type of the solution (if the required flag is set). *)
+    let* evm :=
+      if uf.(uf_unify_types)
+      then 
+        let* entry := lift_option $ EvarMap.lookup evm ev in
+        let* sol_ty := 
+          (* TODO : this should be retyping. *)
+          match Checker.infer Σ φ entry.(ev_nctx) [] sol with 
+          | Checked ty => Success ty
+          | TypeError _ => UnifError (InternalError "meta_inst : typecheck error")
+          end 
+        in
+        let* entry := lift_option $ EvarMap.lookup evm ev in
+        let ev_ty := instantiate_evar entry.(ev_nctx) subs entry.(ev_concl) in
+        unify Cumul Γ sol_ty ev_ty evm
+      else Success evm
+    in 
+    (* Check the evar does not occur in the solution. *)
+    if evar_occurs evm ev sol then UnifError (OccurCheck ev sol) else 
+    (* Finally define the evar. *)
+    Success (EvarMap.define evm ev sol)
   else UnifError NotSameHead
-
-(* Check the evar and t have the same type. *)
-  let* t_ty := 
-    match @Checker.infer cf default_fuel Σ φ Δ Γ t with 
-    | Checked t_ty => Success t_ty 
-    | TypeError err => UnifError (InternalError "Attempt to instantiate with an ill-typed term")
-    end 
-  in 
-  let* ev_ty := lift_option $ EvarMap.evar_concl evm ev in
-  let* evm := unify pb Γ ev_ty t_ty evm in 
-  (* Define the evar. *)
-  let evm := EvarMap.define evm ev t in 
-  Success evm
 
 with try_same_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
   match whd_evars evm t, whd_evars evm t' with 
