@@ -32,6 +32,64 @@ Record unif_flags :=
 
 (** * Evar map. *)
 
+(** [sort_leq_constraints s1 s2] returns a set of universe constraints that encode 
+    the inequality [s1 <= s2], or [None] if [s1 <= s2] is trivially unsatisfiable. *)
+Definition sort_leq_constraints (s1 s2 : Sort.t) : option ConstraintSet.t := 
+  (* Make a constraint between two [LevelExpr.t]. *)
+  let lexpr_edge (l r : LevelExpr.t) : UnivConstraint.t :=
+    let diff := (Z.of_nat l.2 - Z.of_nat r.2)%Z in (l.1, ConstraintType.Le diff, r.1)
+  in
+  match s1, s2 with
+  (* Trivial constraints. *)
+  | sSProp, sSProp
+  | sProp, sProp 
+  | sSProp, sType _
+  | sProp, sType _ => Some ConstraintSet.empty
+  (* Type <= Type *)
+  | sType l, sType r =>
+    match Universe.exprs l, Universe.exprs r with
+    (* No algebraics : add a single constraint. *)
+    | (l, []), (r, []) => Some $ ConstraintSet.singleton $ lexpr_edge l r
+    (* Algebraic on the left-hand side : add multiple constraints. *)
+    | (l, ls), (r, []) =>
+      Some $ List.fold_left 
+        (fun acc l' => ConstraintSet.add (lexpr_edge l' r) acc) 
+        (l :: ls) 
+        ConstraintSet.empty
+    (* Algebraics on the right-hand side are not supported. *) 
+    | _, _ => None
+    end
+  (* Everything else is unsatisfiable. *)
+  | _, _ => None
+  end.
+
+(** [eq_constraints s1 s2] returns a set of constraints that encode 
+    the equality [s1 = s2], or [None] if [s1 = s2] is trivially unsatisfiable. *)
+Definition sort_eq_constraints (s1 s2 : Sort.t) : option ConstraintSet.t := 
+  (* Make an equality constraint between two [LevelExpr.t]. *)
+  let lexpr_cstr (l r : LevelExpr.t) : ConstraintSet.t :=
+    let diff := (Z.of_nat l.2 - Z.of_nat r.2)%Z in
+    if diff == 0%Z
+    then ConstraintSet.singleton (l.1, ConstraintType.Eq, r.1) 
+    else ConstraintSet.add (l.1, ConstraintType.Le diff, r.1) $
+         ConstraintSet.singleton (r.1, ConstraintType.Le $ Z.opp diff, l.1)
+  in
+  match s1, s2 with
+  (* Trivial constraints. *)
+  | sSProp, sSProp
+  | sProp, sProp => Some ConstraintSet.empty
+  (* Type = Type *)
+  | sType l, sType r =>
+    match Universe.exprs l, Universe.exprs r with
+    (* No algebraics. *)
+    | (l, []), (r, []) => Some $ lexpr_cstr l r
+    (* Algebraics are not supported yet. *) 
+    | _, _ => None
+    end
+  (* Everything else is unsatisfiable. *)
+  | _, _ => None
+  end.
+      
 (** Evar identifiers. *)
 Definition evar := nat.
 
@@ -59,10 +117,15 @@ Record t :=
   { (** A map from evars to evar entries. *)
     evm_map : EMap.t evar_entry
   ; (** A counter used to generate fresh evars. *)
-    evm_counter : nat }.
+    evm_counter : nat
+  ; (** The universe graph. *)
+    evm_universes : universes_graph }.
 
 (** The empty evar map. *)
-Definition empty : t := {| evm_map := @EMap.empty evar_entry ; evm_counter := 0 |}.
+Definition empty : t := 
+  {| evm_map := @EMap.empty evar_entry 
+  ;  evm_counter := 0
+  ;  evm_universes := uGraph.init_graph |}.
 
 (** Lookup the entry of an evar in the evar map. *)
 Definition lookup (evm : t) (ev : evar) : option evar_entry :=
@@ -100,7 +163,9 @@ Definition define (evm : t) (ev : evar) (def : term) : t :=
       ;  ev_concl := e.(ev_concl)
       ;  ev_def  := Some def |}
     in
-    {| evm_map := EMap.add ev e evm.(evm_map) ; evm_counter := evm.(evm_counter) |}
+    {| evm_map := EMap.add ev e evm.(evm_map) 
+    ;  evm_counter := evm.(evm_counter)
+    ;  evm_universes := evm.(evm_universes) |}
   end.
 
 Definition new_evar (evm : t) (nctx : named_context) (concl : term) : (t * evar) :=
@@ -113,10 +178,46 @@ Definition new_evar (evm : t) (nctx : named_context) (concl : term) : (t * evar)
   let ev := evm.(evm_counter) in
   (* Don't forget to increment the evar counter. *)
   let evm := 
-    {| evm_map := EMap.add ev entry evm.(evm_map) ; evm_counter := S evm.(evm_counter) |}
+    {| evm_map := EMap.add ev entry evm.(evm_map) 
+    ;  evm_counter := S evm.(evm_counter)
+    ;  evm_universes := evm.(evm_universes) |}
   in
   (evm, ev).
-  
+
+(** [add_univ_constraints evm cstrs] adds universe constraints [cstrs] to the evar map [evm].
+    It returns [None] if the added constraints are inconsistent. *)
+Definition add_univ_constraints `{cf : checker_flags} (evm : EvarMap.t) 
+  (cstrs : ConstraintSet.t) : option EvarMap.t :=
+  let universes :=
+    ConstraintSet.fold 
+      (fun cstr ugraph => 
+        match cstr with 
+        | (l, ConstraintType.Le n, r) => 
+          wGraph.add_edge ugraph (l, n, r)
+        | (l, ConstraintType.Eq, r) =>
+          let ugraph := wGraph.add_edge ugraph (l, 0%Z, r) in 
+          wGraph.add_edge ugraph (r, 0%Z, l)
+        end)
+      cstrs
+      evm.(evm_universes)
+  in
+  (* Check the new constraints are still consistent. *)
+  if wGraph.is_acyclic universes then 
+    Some {| evm_map := evm.(evm_map)
+         ;  evm_counter := evm.(evm_counter)
+         ;  evm_universes := universes |}
+  else None.
+
+(** [set_eq_sort evm s1 s2] adds constraints to [evm] to enforce [s1 = s1].
+    It returns [None] if the added constraints are inconsistent. *)
+Definition set_eq_sort `{cf : checker_flags} (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
+  add_univ_constraints evm =<< sort_eq_constraints s1 s2.
+
+(** [set_leq_sort evm s1 s2] adds constraints to [evm] to enforce [s1 <= s1].
+    It returns [None] if the added constraints are inconsistent. *)
+Definition set_leq_sort `{cf : checker_flags} (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
+    add_univ_constraints evm =<< sort_leq_constraints s1 s2.
+
 End EvarMap.
 
 
@@ -168,8 +269,10 @@ Fixpoint whd_evars (evm : EvarMap.t) (t : term) {struct t} : term :=
 
 (** * Unification errors. *)
 
+(* TODO : document this. *)
 Inductive unif_error := 
   | NotSameHead : unif_error
+  | NotSameArgSize : unif_error
   | OccurCheck : evar -> term -> unif_error
   | UnivInconsistency : unif_error
   | InternalError : string -> unif_error.
@@ -428,7 +531,7 @@ Definition invert (evm : EvarMap.t) (map : EMap.t (list nat)) (nctx : named_cont
 End Invert.
 
 Section Algorithm.
-Context `{uf : unif_flags} `{cf : checker_flags} (φ : universes_graph) (Σ : global_env) (Δ : named_context).
+Context `{uf : unif_flags} `{cf : checker_flags} (Σ : global_env) (Δ : named_context).
 
 Implicit Types (pb : conv_pb) (Γ : context).
 Existing Instance default_fuel.
@@ -471,7 +574,7 @@ Definition invert_lambdas (evm : EvarMap.t) (Γ : context) (map : EMap.t (list n
       (* TODO : remove [nf_evars] and add evar handling to the checker. *)
       (* TODO : use retyping instead of full typing here. *)
       mlet ty <-
-        match Checker.infer Σ φ Δ Γ (nf_evars evm arg) with 
+        match Checker.infer Σ (EvarMap.evm_universes evm) Δ Γ $ nf_evars evm arg with 
         | Checked ty => Some ty 
         | TypeError _ => None
         end
@@ -523,7 +626,8 @@ Definition intersect evm (xs ys : list term) : option (list nat) :=
     match xs, ys with 
     | [], [] => Some diff
     | x :: xs, y :: ys =>
-      if eq_term φ x y then loop (S i) xs ys diff 
+      (* TODO : push evar handling in [eq_term]. *)
+      if eq_term (EvarMap.evm_universes evm) (nf_evars evm x) (nf_evars evm y) then loop (S i) xs ys diff 
       else if is_var x && is_var y then loop (S i) xs ys (i :: diff)
       else if uf.(uf_aggressive) then loop (S i) xs ys (i :: diff)
       else None
@@ -562,40 +666,67 @@ Definition meta_inst_solution Γ (ev : evar) (subs args : list term) (t : term) 
   (* TODO : refresh universes. *)
   ret (evm, t1).
 
-(** Main unification function. *)
-Fixpoint unify pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
-  if is_evar evm t || is_evar evm t'
-  then try_instantiate pb Γ t t' evm
-  else try_same_head pb Γ t t' evm
+(** [tapp f args] represents the application of a term [f] to arguments [args].
+    The list of arguments can be empty. *)
+Definition tapp := term * list term.
 
-(** Precondition : either t or t' is an evar. *)
+(** [whd_tapp evm t] expands evars and removes casts in the head of [t]. *)
+Fixpoint whd_tapp evm (t : tapp) {struct t} : tapp :=
+  let (f, args) := t in
+  match whd_evars evm f with 
+  | tApp f' args' => whd_tapp evm (f', args' ++ args)
+  | tCast f' _ _ => whd_tapp evm (f', args)
+  | f' => (f', args)
+  end.
+
+(** Main unification function(s). *)
+Fixpoint unify pb Γ (t t' : term) evm {struct pb} : unif_result EvarMap.t :=
+  let t := whd_tapp evm (t, []) in 
+  let t' := whd_tapp evm (t', []) in 
+  if is_evar evm t.1 || is_evar evm t'.1 then 
+    try_instantiate pb Γ t t' evm
+  else 
+    try_canonical_structures pb Γ t t' evm <|> 
+    try_app_fo pb Γ t t' evm <|>
+    try_reduce pb Γ t t' evm
+
+(** [try_instantiate] is called when either [t] or [t'] is an evar (possible applied
+    to a suspended subsitution and arguments), and tries to apply rules which instantiate evars. *)
 with try_instantiate pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
-  match whd_evars evm t, whd_evars evm t' with 
+  let t := whd_tapp evm t in 
+  let t' := whd_tapp evm t' in
+  match t.1, t'.1 with 
   | tEvar ev subs, tEvar ev' subs' => 
     if ev == ev' 
     (* Meta-Same *)
-    then meta_same evm ev subs subs'
+    then 
+      let* evm := meta_same evm ev subs subs' in 
+      ise_list2 (unify Conv Γ) t.2 t'.2 evm
     (* Meta-Meta *)
     else
       (* We try both directions, but first the one with the longest substitution. *)
-      let '(ev1, ev2, subs1, subs2, t1, t2) := 
+      let '(ev1, ev2, subs1, subs2, args1, args2, t1, t2) := 
         if #|subs| <? #|subs'|
-        then (ev', ev, subs', subs, t, t')
-        else (ev, ev', subs, subs', t', t)
+        then (ev', ev, subs', subs, t'.2, t.2, t, t')
+        else (ev, ev', subs, subs', t.2, t'.2, t', t)
       in 
-      meta_inst pb Γ ev1 subs1 [] t1 evm <|> 
-      meta_inst pb Γ ev2 subs2 [] t2 evm
+      meta_inst pb Γ ev1 subs1 args1 t1 evm <|> 
+      meta_inst pb Γ ev2 subs2 args2 t2 evm
   (* Meta-InstL *)
-  | tEvar ev subs, t0 => meta_inst pb Γ ev subs [] t0 evm
+  | tEvar ev subs, _ => meta_inst pb Γ ev subs t.2 t' evm
   (* Meta-InstR *)
-  | t0, tEvar ev subs => meta_inst pb Γ ev subs [] t0 evm
+  | _, tEvar ev' subs' => meta_inst pb Γ ev' subs' t'.2 t evm
   | _, _ => UnifError (InternalError "try_instantiate : expected an evar")
   end
 
 (** [meta_inst pb Γ ev subs t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t]. *)
-with meta_inst pb Γ ev subs args t evm {struct pb} : unif_result EvarMap.t :=
+with meta_inst pb Γ ev subs args (t : tapp) evm {struct pb} : unif_result EvarMap.t :=
+  let t := 
+    (* TODO : beta reduce if the configuration option is set. *)
+    tApp t.1 t.2 
+  in
   let is_var t := 
-    match t with tVar _ | tRel _ => true | _ => false end 
+    match whd_evars evm t with tVar _ | tRel _ => true | _ => false end 
   in
   (* Check the substitution and arguments contain only variables (tVars and tRels). *)
   if List.forallb is_var (subs ++ args) then 
@@ -608,7 +739,7 @@ with meta_inst pb Γ ev subs args t evm {struct pb} : unif_result EvarMap.t :=
         let* entry := lift_option $ EvarMap.lookup evm ev in
         let* sol_ty := 
           (* TODO : this should be retyping. *)
-          match Checker.infer Σ φ entry.(ev_nctx) [] sol with 
+          match Checker.infer Σ (EvarMap.evm_universes evm) entry.(ev_nctx) [] sol with 
           | Checked ty => Success ty
           | TypeError _ => UnifError (InternalError "meta_inst : typecheck error")
           end 
@@ -624,18 +755,39 @@ with meta_inst pb Γ ev subs args t evm {struct pb} : unif_result EvarMap.t :=
     Success (EvarMap.define evm ev sol)
   else UnifError NotSameHead
 
-with try_same_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
+with try_canonical_structures pb Γ (t t' : tapp) evm {struct pb} : unif_result EvarMap.t :=
+  UnifError (InternalError "try_canonical_structures : not implemented yet")
+
+with try_app_fo pb Γ (t t' : tapp) evm {struct pb} : unif_result EvarMap.t :=
+  let (f, args) := whd_tapp evm t in 
+  let (f', args') := whd_tapp evm t' in
+  if #|args| == #|args'| then 
+    (* Unify the heads. *)
+    let* evm := unify_head pb Γ f f' evm in 
+    (* Unify the arguments. *)
+    ise_list2 (unify Conv Γ) args args' evm
+  else 
+    UnifError NotSameArgSize
+
+with try_reduce pb Γ (t t' : tapp) evm {struct pb} : unif_result EvarMap.t :=
+  UnifError (InternalError "try_reduce : not implemented yet")
+
+with unify_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
   match whd_evars evm t, whd_evars evm t' with 
   (* Type-Same *)
   | tSort s, tSort s' =>
-    let ok :=
+    (* Enforce the new universe constraints. *)
+    let evm :=
       match pb with 
-      | Conv => check_eqb_sort φ s s' 
-      | Cumul => check_leqb_sort φ s s'
+      | Conv => EvarMap.set_eq_sort evm s s' 
+      | Cumul => EvarMap.set_eq_sort evm s s'
       end
     in 
-    (* TODO : add universe constraints if needed. *)
-    if ok then Success evm else UnifError UnivInconsistency
+    (* Check the universe graph is still consistent. *)
+    match evm with
+    | Some evm => Success evm 
+    | None => UnifError UnivInconsistency
+    end
   (* Lam-Same *)
   | tLambda x ty body, tLambda _ ty' body' =>
     let* evm := unify Conv Γ ty ty' evm in 

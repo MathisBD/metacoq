@@ -661,6 +661,10 @@ Local Notation lzero := Level.lzero.
 (* vtn = variable to noprop *)
 Local Notation vtn := VariableLevel.to_noprop.
 
+Print VariableLevel.to_noprop.
+
+About EdgeSet.
+
 Definition universes_graph := t.
 Definition init_graph : universes_graph
   := (VSet.singleton lzero, EdgeSet.empty, lzero).
@@ -1400,7 +1404,7 @@ Section CheckLeq.
     - intros H. unfold_univ_rel0. apply leq_universe_vertices1; tas.
     - apply leq_universe_vertices0.
   Qed.
-
+  
   Definition leqb_level_n n (l l' : Level.t)
     := leqb_vertices G n l l'.
 
