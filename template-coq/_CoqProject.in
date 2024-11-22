@@ -20,6 +20,7 @@ theories/Normal.v
 theories/WcbvEval.v
 theories/Checker.v
 theories/EtaExpand.v
+theories/Evars.v
 theories/TemplateProgram.v
 
 # The Template monad
