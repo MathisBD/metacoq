@@ -54,15 +54,25 @@ Inductive unif_result A : Type :=
 Arguments Success {A}%_type_scope a.
 Arguments UnifError {A}%_type_scope error.
 
+(*
+Log.t := list (Log.tree + doc unit)
+Log.tree := ...
+
+M A := Log.t * unif_result A
+
+Log.msg : doc unit -> M unit
+Log.problem : EvarMap.t -> context -> conv_pb -> term -> term -> M EvarMap.t -> M EvarMap.t
+
+*)
+
+
 (** * Logging. *)
 
 (** We define logging functions specially tailored to unification. *)
 Module Log.
 
-(** [UnifProblem] represents a unification problem, possibly containing 
-      subproblems or messages. *)
-  
-Inductive t := mk
+(** A [Log.node] contains all the log data pertaining to a single unification problem. *)
+Record node t := mknode
   { (** The initial evar map. *)
     evm : EvarMap.t 
   ; (** The local context. *)
@@ -74,54 +84,72 @@ Inductive t := mk
   ; (** The second term we are unifying. *)
     t2 : term 
   ; (** A list of subproblems or messages, ordered from last to first. *)
-    elements : list (t + doc unit) 
+    elements : t
   ; (** The result of unification. *)
     res : unif_result EvarMap.t }.
 
-(** Add a subproblem to the current problem. *)
-Definition subproblem (l : t) (sub_pb : t) : t :=
-  mk l.(evm) l.(ctx) l.(pb) l.(t1) l.(t2) (inl sub_pb :: l.(elements)) l.(res).
+(** A log contains a list of unification problems and messages. *)
+Inductive t := Log : list (node t + doc unit) -> t.
 
-(** Add a *)
-Definition msg (l : t) (m : doc unit) : t :=
-  mk l.(evm) l.(ctx) l.(pb) l.(t1) l.(t2) (inr m :: l.(elements)) l.(res).
+(** The empty log. *)
+Definition empty : t := Log [].
 
-(** Log a unification problem. *)
-Definition problem evm ctx pb t1 t2 (k : -> list (t + doc unit) * unif_result EvarMap.t) : 
-  unif_result EvarMap.t :=
-  
-  
+(** Append logs. *)
+Definition append (l l' : t) :=
+  match l, l' with 
+  | Log l, Log l' => Log (l ++ l')
+  end.
 
 End Log.
 
+(** * Unification monad. *)
+
+(** Unification works in a monad [M], which can fail with a [unif_error]
+    and log data to a [Log.t]. *)
+Definition M A := Log.t * unif_result A. 
+
+(** Monadic return. *)
+Definition retM {A} (a : A) : M A := (Log.empty, Success a).
+
+(** Monadic fail. *)
+Definition failM {A} (err : unif_error) : M A :=
+  (Log.empty, UnifError err).
+
 (** Monadic bind. *)
-Definition bind_ {A} {B} (ma : unif_result A) (mf : A -> unif_result B) : unif_result B :=
+Definition bindM {A} {B} (ma : M A) (mf : A -> M B) : M B :=
   match ma with 
-  | Success a => mf a 
-  | UnifError err => UnifError err
+  | (l, Success a) => let (l', res) := mf a in (Log.append l l', res)
+  | (l, UnifError err) => (l, UnifError err)
   end.
-Notation "'let*' x := c1 'in' c2" := (bind_ c1 (fun x => c2))
+Notation "'let*' x := c1 'in' c2" := (bindM c1 (fun x => c2))
   (at level 100, x pattern, c1 at next level, right associativity).
 
 (** Monadic alternative. *)
-Definition msum {A} (x y : unif_result A) : unif_result A :=
+Definition orM {A} (x y : M A) : M A :=
   match x with 
-  | Success _ => x 
-  | UnifError _ => y
+  | (_, Success _) => x 
+  | (_, UnifError _) => y
   end.
-Notation "x <|> y" := (msum x y) (at level 85, right associativity).
+Notation "x <|> y" := (orM x y) (at level 85, right associativity).
    
-(** Lift a value from the [option] monad to the [unif_result] monad.
+(** Lift a value from the [option] monad to [M].
     [None] is mapped to [UnifError (InternalError ...)]. *)
-Definition lift_option {A} (x : option A) : unif_result A :=
+Definition lift_option {A} (x : option A) : M A :=
   match x with 
-  | Some x => Success x
-  | None => UnifError (InternalError "lift_option")
+  | Some x => (Log.empty, Success x)
+  | None => (Log.empty, UnifError (InternalError "lift_option"))
   end.
 
-(*Definition assert (msg : string) s (cond : bool) : state :=
-  if cond then s 
-  else (s.1, UnifFailure (AssertionFailure msg)).*)
+(** Log a simple message. *)
+Definition log_msg (msg : doc unit) : M unit :=
+  (Log.Log [inr msg], Success tt).
+
+(** Log a unification (sub)problem. It collects the logs of [problem],
+    packages them in a [Log.node], and returns the same [unif_result] as [problem].  *)
+Definition log_problem pb Γ t t' evm (problem : M EvarMap.t) : M EvarMap.t :=
+  let (elements, res) := problem in 
+  let node := Log.mknode _ evm Γ pb t t' elements res in
+  (Log.Log [inl node], res).
 
 (** * Unification algorithm. *)
 
@@ -132,13 +160,13 @@ Definition is_evar evm t : bool :=
   | _ => false 
   end.
 
-Fixpoint ise_list2 {A B} (f : A -> B -> EvarMap.t -> unif_result EvarMap.t) 
-  (xs : list A) (ys : list B) (evm : EvarMap.t) : unif_result EvarMap.t :=
+Fixpoint ise_list2 {A B} (f : A -> B -> EvarMap.t -> M EvarMap.t) 
+  (xs : list A) (ys : list B) (evm : EvarMap.t) : M EvarMap.t :=
   match xs, ys with 
-  | [], [] => Success evm 
+  | [], [] => retM evm 
   | x :: xs, y :: ys =>
     let* evm := f x y evm in ise_list2 f xs ys evm
-  | _, _ => UnifError NotSameHead
+  | _, _ => failM NotSameHead
   end.
 
 (** [rebuild_case env ci pred bs] rebuilds the terms corresponding to the 
@@ -421,18 +449,19 @@ Definition intersect evm (xs ys : list term) : option (list nat) :=
   loop 0 xs ys [].
           
 (** [meta_same evm ev subs1 subs2] implements the Meta-Same rule to unify [ev[subs1] =?= ev[subs2]]. *)
-Definition meta_same evm (ev : evar) (subs1 subs2 : list term) : unif_result EvarMap.t :=
+(* TODO : better unif_errors. *)
+Definition meta_same evm (ev : evar) (subs1 subs2 : list term) : M EvarMap.t :=
   (* Prune the evar on the positions where [subs1] and [subs2] disagree. *)
   match intersect evm subs1 subs2 with
   | Some [] => 
     (* Fast path to avoid pruning if unnecessary. *) 
-    Success evm
+    retM evm
   | Some pos =>
     match prune evm ev pos with 
-    | Some evm => Success evm 
-    | None => UnifError NotSameHead
+    | Some evm => retM evm 
+    | None => failM NotSameHead
     end
-  | None => UnifError NotSameHead
+  | None => failM NotSameHead
   end.
 
 (** Helper function used to implement [meta_inst]. 
@@ -464,7 +493,8 @@ Fixpoint whd_tapp evm (t : tapp) {struct t} : tapp :=
   end.
 
 (** Main unification function(s). *)
-Fixpoint unify pb Γ (t t' : term) evm {struct pb} : unif_result EvarMap.t :=
+Fixpoint unify pb Γ (t t' : term) evm {struct pb} : M EvarMap.t :=
+  log_problem pb Γ t t' evm $
   let t := whd_tapp evm (t, []) in 
   let t' := whd_tapp evm (t', []) in 
   if is_evar evm t.1 || is_evar evm t'.1 then 
@@ -476,7 +506,8 @@ Fixpoint unify pb Γ (t t' : term) evm {struct pb} : unif_result EvarMap.t :=
 
 (** [try_instantiate] is called when either [t] or [t'] is an evar (possible applied
     to a suspended subsitution and arguments), and tries to apply rules which instantiate evars. *)
-with try_instantiate pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
+with try_instantiate pb Γ t t' evm {struct pb} : M EvarMap.t :=
+  let* _ := log_msg $ str "Trying to instantiate evars." in
   let t := whd_tapp evm t in 
   let t' := whd_tapp evm t' in
   match t.1, t'.1 with 
@@ -500,11 +531,12 @@ with try_instantiate pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
   | tEvar ev subs, _ => meta_inst pb Γ ev subs t.2 t' evm
   (* Meta-InstR *)
   | _, tEvar ev' subs' => meta_inst pb Γ ev' subs' t'.2 t evm
-  | _, _ => UnifError (InternalError "try_instantiate : expected an evar")
+  | _, _ => failM $ InternalError "try_instantiate : expected an evar"
   end
 
 (** [meta_inst pb Γ ev subs t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t]. *)
-with meta_inst pb Γ ev subs args (t : tapp) evm {struct pb} : unif_result EvarMap.t :=
+(* TODO : better unif_errors. *)
+with meta_inst pb Γ ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
   let t := 
     (* TODO : beta reduce if the configuration option is set. *)
     tApp t.1 t.2 
@@ -524,25 +556,27 @@ with meta_inst pb Γ ev subs args (t : tapp) evm {struct pb} : unif_result EvarM
         let* sol_ty := 
           (* TODO : this should be retyping. *)
           match Checker.infer Σ (EvarMap.evm_universes evm) entry.(ev_nctx) [] sol with 
-          | Checked ty => Success ty
-          | TypeError _ => UnifError (InternalError "meta_inst : typecheck error")
+          | Checked ty => retM ty
+          | TypeError _ => failM $ InternalError "meta_inst : typecheck error"
           end 
         in
         let* entry := lift_option $ EvarMap.lookup evm ev in
         let ev_ty := instantiate_evar entry.(ev_nctx) subs entry.(ev_concl) in
         unify Cumul Γ sol_ty ev_ty evm
-      else Success evm
+      else retM evm
     in 
     (* Check the evar does not occur in the solution. *)
-    if evar_occurs evm ev sol then UnifError (OccurCheck ev sol) else 
+    if evar_occurs evm ev sol then failM $ OccurCheck ev sol else 
     (* Finally define the evar. *)
-    Success (EvarMap.define evm ev sol)
-  else UnifError NotSameHead
+    retM $ EvarMap.define evm ev sol
+  else failM NotSameHead
 
-with try_canonical_structures pb Γ (t t' : tapp) evm {struct pb} : unif_result EvarMap.t :=
-  UnifError (InternalError "try_canonical_structures : not implemented yet")
+with try_canonical_structures pb Γ (t t' : tapp) evm {struct pb} : M EvarMap.t :=
+  let* _ := log_msg $ str "Trying canonical structure resolution." in
+  failM $ InternalError "try_canonical_structures : not implemented yet"
 
-with try_app_fo pb Γ (t t' : tapp) evm {struct pb} : unif_result EvarMap.t :=
+with try_app_fo pb Γ (t t' : tapp) evm {struct pb} : M EvarMap.t :=
+  let* _ := log_msg $ str "Trying app first-order." in
   let (f, args) := whd_tapp evm t in 
   let (f', args') := whd_tapp evm t' in
   if #|args| == #|args'| then 
@@ -551,12 +585,13 @@ with try_app_fo pb Γ (t t' : tapp) evm {struct pb} : unif_result EvarMap.t :=
     (* Unify the arguments. *)
     ise_list2 (unify Conv Γ) args args' evm
   else 
-    UnifError NotSameArgSize
+    failM NotSameArgSize
 
-with try_reduce pb Γ (t t' : tapp) evm {struct pb} : unif_result EvarMap.t :=
-  UnifError (InternalError "try_reduce : not implemented yet")
+with try_reduce pb Γ (t t' : tapp) evm {struct pb} : M EvarMap.t :=
+  let* _ := log_msg $ str "Trying to reduce." in
+  failM $ InternalError "try_reduce : not implemented yet"
 
-with unify_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
+with unify_head pb Γ t t' evm {struct pb} : M EvarMap.t :=
   match whd_evars evm t, whd_evars evm t' with 
   (* Type-Same *)
   | tSort s, tSort s' =>
@@ -569,8 +604,8 @@ with unify_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
     in 
     (* Check the universe graph is still consistent. *)
     match evm with
-    | Some evm => Success evm 
-    | None => UnifError UnivInconsistency
+    | Some evm => retM evm 
+    | None => failM UnivInconsistency
     end
   (* Lam-Same *)
   | tLambda x ty body, tLambda _ ty' body' =>
@@ -586,17 +621,17 @@ with unify_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
     unify pb (Γ ,, vdef x def ty) body body' evm
   (* Rigid-Same *)
   | tRel n, tRel n' => 
-    if n == n' then Success evm else UnifError NotSameHead
+    if n == n' then retM evm else failM NotSameHead
   | tVar v, tVar v' => 
-    if v == v' then Success evm else UnifError NotSameHead
+    if v == v' then retM evm else failM NotSameHead
   | tConst c _, tConst c' _ =>
-    if c == c' then Success evm else UnifError NotSameHead
+    if c == c' then retM evm else failM NotSameHead
   | tInd ind _, tInd ind' _ =>
-    if ind == ind' then Success evm else UnifError NotSameHead
+    if ind == ind' then retM evm else failM NotSameHead
   | tConstruct ind n _, tConstruct ind' n' _ =>
-    if (ind == ind') && (n == n') then Success evm else UnifError NotSameHead  
+    if (ind == ind') && (n == n') then retM evm else failM NotSameHead  
   | tProj p t, tProj p' t' =>
-    if p == p' then unify Conv Γ t t' evm else UnifError NotSameHead
+    if p == p' then unify Conv Γ t t' evm else failM NotSameHead
   | tFix defs n, tFix defs' n'
   | tCoFix defs n, tCoFix defs' n' =>
     if n == n' then 
@@ -604,7 +639,7 @@ with unify_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
       let* evm := ise_list2 (unify Conv Γ) (List.map dtype defs) (List.map dtype defs') evm in
       (* Then unify the bodies in an extended context. *)
       ise_list2 (unify Conv (Γ ,,, fix_context defs)) (List.map dbody defs) (List.map dbody defs') evm
-    else UnifError NotSameHead
+    else failM NotSameHead
   | tCase ci pred x bs, tCase ci' pred' x' bs' =>
     if ci == ci' then 
       let* (pred, bs) := lift_option $ rebuild_case Σ ci pred bs in
@@ -615,12 +650,12 @@ with unify_head pb Γ t t' evm {struct pb} : unif_result EvarMap.t :=
       let* evm := unify Conv Γ x x' evm in
       (* Unify the branches. *)
       ise_list2 (unify Conv Γ) bs bs' evm
-    else UnifError NotSameHead
+    else failM NotSameHead
   (* App-FO *)
   | tApp f ts, tApp f' ts' => 
     let* evm := unify pb Γ f f' evm in 
     ise_list2 (unify Conv Γ) ts ts' evm
-  | _, _ => UnifError NotSameHead
+  | _, _ => failM NotSameHead
   end.
 
 End Algorithm.

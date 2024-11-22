@@ -661,8 +661,6 @@ Local Notation lzero := Level.lzero.
 (* vtn = variable to noprop *)
 Local Notation vtn := VariableLevel.to_noprop.
 
-Print VariableLevel.to_noprop.
-
 About EdgeSet.
 
 Definition universes_graph := t.

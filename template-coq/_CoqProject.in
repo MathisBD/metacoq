@@ -6,14 +6,14 @@
 theories/Ast.v
 theories/AstUtils.v
 theories/ReflectAst.v
-theories/TemplateEnvMap.v
 theories/Induction.v
 theories/WfAst.v
-theories/LiftSubst.v
 theories/UnivSubst.v
-theories/Pretty.v
+theories/LiftSubst.v
 theories/TermEquality.v
 theories/Typing.v
+theories/TemplateEnvMap.v
+theories/Pretty.v
 theories/Reduction.v
 theories/TypingWf.v
 theories/Normal.v

@@ -398,7 +398,7 @@ Proof.
   induction Γ in k, k' |- *; simpl; auto.
   destruct a as [na [body|] ty].
   now rewrite <- Nat.add_assoc, (IHΓ (k + 1) k').
-  simpl. now rewrite <- Nat.add_assoc, (IHΓ (k + 1) k'), map_app.
+  simpl. rewrite !rev_cons. now rewrite <- Nat.add_assoc, (IHΓ (k + 1) k'), map_app.
 Qed.
 
 Lemma simpl_subst_k Σ (N : list term) (M : term) :

@@ -991,7 +991,7 @@ Module Environment (T : Term).
     induction Γ in l, k |- *; simpl; auto.
     destruct a as [na [body|] ty]; simpl.
     now rewrite IHΓ.
-    now rewrite IHΓ -app_assoc.
+    now rewrite rev_cons IHΓ -app_assoc.
   Qed.
 
   Lemma to_extended_list_k_cons d Γ k :
@@ -1006,6 +1006,7 @@ Module Environment (T : Term).
     destruct d as [na [body|] ty]. simpl.
     now rewrite reln_alt_eq Nat.add_1_r.
     simpl. rewrite reln_alt_eq.
+    rewrite rev_cons.
     now rewrite <- app_assoc, !app_nil_r, Nat.add_1_r.
   Qed.
 
@@ -1130,7 +1131,7 @@ Module Environment (T : Term).
 
   Lemma context_assumptions_rev Γ : context_assumptions (rev Γ) = context_assumptions Γ.
   Proof using Type.
-    induction Γ; simpl; auto. rewrite context_assumptions_app IHΓ /=.
+    induction Γ; simpl; auto. rewrite rev_cons context_assumptions_app IHΓ /=.
     destruct (decl_body a); simpl; lia.
   Qed.
 
