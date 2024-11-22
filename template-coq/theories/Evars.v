@@ -5,7 +5,7 @@
     The current definition are meant for execution (not for proofs), and thus
     we disable the guard checker for simplicity. *)
 
-From Coq.FSets Require Import FMapAVL.
+From Coq.FSets Require Import FSetAVL FMapAVL.
 From MetaCoq.Utils Require Import utils.
 From MetaCoq.Common Require Import BasicAst Environment uGraph config.
 From MetaCoq.Template Require Import Ast AstUtils Typing.
@@ -92,8 +92,9 @@ Record evar_entry :=
         It should be well-typed in the evar's context. *)
     ev_def : option term }.
 
-(** Maps indexed by evars. *)
+(** Set and maps indexed by evars. *)
 Module EvarOT := OrderedTypeEx.Nat_as_OT.
+Module ESet := FSetAVL.Make EvarOT.
 Module EMap := FMapAVL.Make EvarOT.
 
 Module EvarMap.
