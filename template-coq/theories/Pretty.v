@@ -18,10 +18,10 @@ Module PrettyFlags.
 Record t := mk
   { (** Should we print universes ? *)
     universes : bool 
+  ; (** Should we print case return clauses ? *)
+    case_returns : bool
   ; (** Should we print evar instances (delayed substitutions) ? *)
     evar_instances : bool 
-  ; (** Should we print match predicates ? *)
-    match_preds : bool
   ; (** Should we print all parentheses ? *) 
     parentheses : bool 
   ; (** Should we print full kernel names ? *)
@@ -30,8 +30,8 @@ Record t := mk
         (only relevant when printing declarations) *)
     full_defs : bool }.
 
-(** Don't print any low-level details. *)
-Definition none : t := mk false false false false false false.
+(** Default flags : don't print any low-level details. *)
+Definition default : t := mk false false false false false false.
   
 (** Print all low-level details. *)
 Definition all : t := mk true true true true true true.
@@ -113,7 +113,7 @@ Definition print_kername (kname : kername) : doc unit :=
     match path with 
     | MPfile dirpath => List.rev dirpath ++ acc
     | MPbound dirpath id _ => 
-      (* TODO : is this correct ? *)
+      (* Not sure this is completely correct ? *)
       List.rev (id :: dirpath)
     | MPdot path id => modpath_ids path (id :: acc)
     end
@@ -220,13 +220,63 @@ Definition print_fixpoint (on_term : list ident -> term -> doc unit) (ctx : list
   then align $ group $ prefix ^+^ separate_map sep on_def defs ^/^ str "for" ^+^ func_name
   else align $ group $ prefix ^+^ separate_map sep on_def defs.
 
-(** Helper function to print a single branch (without the leading "|"). *)
+(** Helper function to print a case single branch (without the leading "|"). *)
 Definition print_branch (on_term : list ident -> term -> doc unit) (ctx : list ident) 
   (branch : branch term) (ctor : constructor_body) : doc unit :=
   let var_names := context_names ctor.(cstr_args) in
   let branch_ctx := ctx ,,, var_names in
   let binder := flow_map (break 2) bstr (ctor.(cstr_name) :: rev var_names) in
   group $ align $ binder ^+^ str "=>" ^//^ on_term branch_ctx branch.(bbody).
+
+Print constructor_body.
+Print mutual_inductive_body.
+Print one_inductive_body.
+
+(**
+match x
+      x
+      x
+as x
+in I _ _ _ i i
+     i i i 
+     i i i
+return x 
+       x
+       x with 
+| 
+*)
+
+(** [filter_mask xs bs] filters out all the elements of [xs] for which the corresponding
+    boolean in [bs] is [false]. *)
+Fixpoint filter_mask {A} (xs : list A) (bs : list bool) : list A :=
+  match xs, bs with 
+  | x :: xs, true :: bs => x :: filter_mask xs bs 
+  | _ :: xs, false :: bs => filter_mask xs bs 
+  | _, _ => []
+  end. 
+
+(** Helper function to print a the header of case : [match x as y in I _ _ i i' return z]. *)
+Definition print_case_header (on_term : list ident -> term -> doc unit) (ctx : list ident)  
+  (ind_kname : kername) (scrutinee : term) (pred : predicate term) : doc unit :=
+  let pred_ctx := List.map (fun b => string_of_name b.(binder_name)) pred.(pcontext) in
+  (* [match_clause] is [match xxx]. *)
+  let match_clause := str "match" ^+^ on_term ctx scrutinee in
+  (* [as_clause] is [as xxx]. *)
+  let as_clause := str "as" ^+^ bstr (List.hd "x"%bs pred_ctx) in
+  (* [in_clause] is [in I _ _ ... index1 index2 ...]. *)
+  let ind_name := print_kername ind_kname in
+  let ind_params := repeat #|pred.(pparams)| (str "_") in
+  let ind_indices := rev_map bstr $ List.tl pred_ctx in
+  let in_clause := str "in" ^+^ align $ flow (break 2) $ ind_name :: ind_params :: ind_indices in
+  (* [ret_clause] is [return xxx]. *)
+  let ret_clause := str "return" ^+^ on_term (ctx ,,, pred_ctx) pred.(preturn) in
+  (* Compute which clauses are needed.
+     In the future we could skip the as/in clause if possible. *)
+  let clauses := [match_clause ; as_clause ; in_clause ; ret_clause] in
+  let b := PrettyFlags.case_returns flags in 
+  let bs := [true ; b ; b ; b] in
+  (* Assemble all the clauses. *)
+  align $ group $ separate (break 0) $ filter_mask clauses bs. 
 
 (** Get the precedence of a term. Higher precedences bind tighter : 
     for instance application has the highest precedence.  *)
@@ -327,12 +377,13 @@ Fixpoint print_term_prec (min_prec : nat) (ctx : list ident) (t : term) : doc un
     name ^^ print_univ_instance uinst
   | tCase ci pred x branches =>
     match lookup_inductive env ci.(ci_ind) with
-    | Some (_, body) =>
+    | Some (mbody, body) =>
         (* Print each branch separately. *)
         let branch_docs := map2 (print_branch (print_term_prec 0) ctx) branches body.(ind_ctors) in
         (* Part 1 is [match x with]. *)
+        let ind_kname := (ci.(ci_ind).(inductive_mind).1, body.(ind_name)) in
         let part1 := 
-          group $ str "match" ^+^ print_term_prec 0 ctx x ^/^ str "with"
+          group $ print_case_header (print_term_prec 0) ctx ind_kname x pred ^/^ str "with"
         in
         (* Part 2 is [C1 => ... | C2 => ... | C3 => ... end]*)
         let part2 := 
@@ -520,3 +571,8 @@ Definition print_env (env : global_env) : doc unit :=
   loop env.(declarations) [].
 
 End Printing.
+
+(*** Testing. *)
+
+Definition test : TemplateMonad unit :=
+  mlet '(env, t) <- tmQuoteRec 
