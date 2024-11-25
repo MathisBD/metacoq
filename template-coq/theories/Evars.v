@@ -8,7 +8,7 @@
 From Coq.FSets Require Import FSetAVL FMapAVL.
 From MetaCoq.Utils Require Import utils.
 From MetaCoq.Common Require Import BasicAst Environment uGraph config.
-From MetaCoq.Template Require Import Ast AstUtils Typing.
+From MetaCoq.Template Require Import Ast AstUtils Typing Pretty.
 Import MCMonadNotation.
     
 Unset Guard Checking.
@@ -92,7 +92,17 @@ Record evar_entry :=
         It should be well-typed in the evar's context. *)
     ev_def : option term }.
 
-(** Set and maps indexed by evars. *)
+(** Pretty-print an evar entry. *)
+Definition print_evar_entry (flags : PrettyFlags.t) (env : global_env_ext) (ev_id : evar) (ev : evar_entry) : doc unit :=
+  let header := print_name ev.(ev_name) ^^ str "#" ^^ nat10 ev_id in
+  let concl := str ":" ^+^ print_term flags env [] ev.(ev_concl) in
+  let def := option_map (fun d => str ":=" ^+^ print_term flags env [] d) ev.(ev_def) in
+  match def with 
+  | None => header ^+^ concl 
+  | Some def => header ^+^ align $ group $ concl ^/^ def
+  end.
+
+(** Sets and maps indexed by evars. *)
 Module EvarOT := OrderedTypeEx.Nat_as_OT.
 Module ESet := FSetAVL.Make EvarOT.
 Module EMap := FMapAVL.Make EvarOT.
@@ -107,6 +117,16 @@ Record t :=
     evm_counter : nat
   ; (** The universe graph. *)
     evm_universes : universes_graph }.
+
+(** Pretty-print an evar map. *)
+Definition print (flags : PrettyFlags.t) (env : global_env_ext) (evm : t) : doc unit :=
+  (* Print the evar entries. *)
+  let evars := 
+    separate_map (break 0) (fun '(ev, entry) => print_evar_entry flags env ev entry) $ 
+      EMap.elements evm.(evm_map) 
+  in
+  (* TODO : print the universe constraints. *)
+  align $ group $ evars.
 
 (** The empty evar map. *)
 Definition empty : t := 
