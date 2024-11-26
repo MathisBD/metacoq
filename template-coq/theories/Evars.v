@@ -82,7 +82,7 @@ Definition evar := nat.
 (** An evar entry in the evar map. *)
 Record evar_entry := 
   { (** The evar's name. For printing only. *)
-    ev_name : name 
+    ev_name : ident 
   ; (** The evars' named context. The declarations in this context
         should contain no loose de Bruijn index (tRels). *)
     ev_nctx : named_context
@@ -94,7 +94,7 @@ Record evar_entry :=
 
 (** Pretty-print an evar entry. *)
 Definition print_evar_entry (flags : PrettyFlags.t) (env : global_env_ext) (ev_id : evar) (ev : evar_entry) : doc unit :=
-  let header := print_name ev.(ev_name) ^^ str "#" ^^ nat10 ev_id in
+  let header := bstr ev.(ev_name) ^^ str "#" ^^ nat10 ev_id in
   let concl := str ":" ^+^ print_term flags env [] ev.(ev_concl) in
   let def := option_map (fun d => str ":=" ^+^ print_term flags env [] d) ev.(ev_def) in
   match def with 
@@ -122,7 +122,7 @@ Record t :=
 Definition print (flags : PrettyFlags.t) (env : global_env_ext) (evm : t) : doc unit :=
   (* Print the evar entries. *)
   let evars := 
-    separate_map (break 0) (fun '(ev, entry) => print_evar_entry flags env ev entry) $ 
+    separate_map hardline (fun '(ev, entry) => print_evar_entry flags env ev entry) $ 
       EMap.elements evm.(evm_map) 
   in
   (* TODO : print the universe constraints. *)
@@ -175,11 +175,11 @@ Definition define (evm : t) (ev : evar) (def : term) : t :=
     ;  evm_universes := evm.(evm_universes) |}
   end.
 
-(** [new_evar evm nctx concl] creates a new evar with conclusion [concl] in named context [nctx],
-    and adds it to the evar map [evm]. *)
-Definition new_evar (evm : t) (nctx : named_context) (concl : term) : (t * evar) :=
+(** [new_evar evm name nctx concl] creates a new evar with name [name] and conclusion [concl] 
+    in named context [nctx], and adds it to the evar map [evm]. *)
+Definition new_evar (evm : t) (name : ident) (nctx : named_context) (concl : term) : (t * evar) :=
   let entry := 
-    {| ev_name := nNamed "x"%bs 
+    {| ev_name := name 
     ;  ev_nctx := nctx 
     ;  ev_concl := concl 
     ;  ev_def := None |}

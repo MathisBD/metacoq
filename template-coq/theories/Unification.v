@@ -147,26 +147,33 @@ Definition empty : t := Log [].
 Definition append (l l' : t) : t := Log (unLog l ++ unLog l').
 
 Section Printing.
-Context `{flags : PrettyFlags.t} (env : global_env_ext) (verbose : bool).
+Context `{flags : PrettyFlags.t} (env : global_env) (verbose : bool).
 
 Fixpoint print_elem (elem : node t + doc unit) {struct elem} : doc unit :=
   match elem with 
-  | inl n => print_node n tt
-  | inr d => group $ align $ d
+  | inl n => str "> " ^^ print_node n tt
+  | inr d => str "- " ^^ group $ align $ d
   end
   
 with print_node (n : node t) (u : unit) {struct u} : doc unit :=
   (* TODO : print the evar map and context if verbose. *)
   (* Print the unification equation. *)
   let names := List.map (string_of_name <<< binder_name <<< decl_name) n.(ctx) in
-  let t1 := print_term flags env names n.(t1) in
-  let t2 := print_term flags env names n.(t2) in
+  let t1 := print_term flags (env, Monomorphic_ctx) names n.(t1) in
+  let t2 := print_term flags (env, Monomorphic_ctx) names n.(t2) in
   let op := match n.(pb) with Conv => str "=?=" | Cumul => str "<?=" end in
   let equation := group $ align $ t1 ^/^ op ^/^ t2 in
   (* Print the children elements. *)
-  let elements := List.map (fun e => str ">>" ^^ print_elem e) $ unLog n.(elements) in
+  let elements := List.map print_elem $ unLog n.(elements) in
+  (* Print the result. *)
+  let res :=
+    match n.(res) with 
+    | Success _ => str "[success]"
+    | UnifError _ => str "[error]"
+    end 
+  in
   (* Assemble everything. *)
-  group $ align $ separate hardline (equation :: elements).
+  group $ align $ separate hardline (equation :: elements ++ [res]).
 
 (** Pretty-print a log. The [verbose] flag controls whether we should print
     the evar maps and local contexts. *)
@@ -195,20 +202,20 @@ Definition failM {A} (err : unif_error) : M A :=
 (** Monadic bind. *)
 Definition bindM {A} {B} (ma : M A) (mf : A -> M B) : M B :=
   fun flags =>
-  match ma flags with 
-  | (l, Success a) => let (l', res) := mf a flags in (Log.append l l', res)
-  | (l, UnifError err) => (l, UnifError err)
-  end.
+    match ma flags with 
+    | (l, Success a) => let (l', res) := mf a flags in (Log.append l l', res)
+    | (l, UnifError err) => (l, UnifError err)
+    end.
 Notation "'let*' x := c1 'in' c2" := (bindM c1 (fun x => c2))
   (at level 100, x pattern, c1 at next level, right associativity).
 
 (** Monadic alternative. *)
-Definition orM {A} (x y : M A) : M A :=
+Definition orM {A} (mx my : M A) : M A :=
   fun flags =>
-  match x flags with 
-  | (_, Success _) as res => res
-  | (_, UnifError _) => y flags
-  end.
+    match mx flags with 
+    | (l, Success x) => (l, Success x)
+    | (l, UnifError _) => let (l', y) := my flags in (Log.append l l', y)
+    end.
 Notation "x <|> y" := (orM x y) (at level 85, right associativity).
    
 (** [whenM cond x] executes [x] if [cond] is true, and otherwise does nothing. *)
@@ -322,11 +329,15 @@ Definition find_unique {A} (cond : A -> bool) (xs : list A) : option nat :=
   
 (** Specialization of [find_unique] to named variables (tVars). *)
 Definition find_unique_var evm (id : ident) (ts : list term) :=
-  find_unique (fun t => whd_evars evm t == tVar id) ts.
+  find_unique 
+    (fun t => match whd_evars evm t with tVar id' => id == id' | _ => false end) 
+    ts.
 
 (** Specialization of [find_unique] to de Bruijn variables (tRels). *)
 Definition find_unique_rel evm (n : nat) (ts : list term) :=
-  find_unique (fun t => whd_evars evm t == tRel n) ts.
+  find_unique 
+    (fun t => match whd_evars evm t with tRel n' => n == n' | _ => false end) 
+    ts.
 
 (** [evar_occurs evm ev t] checks if evar [ev] occurs in term [t]. *)
 Fixpoint evar_occurs (evm : EvarMap.t) (ev : evar) (t : term) : bool :=
@@ -484,10 +495,11 @@ Definition invert := Invert.invert.
 Definition invert_lambdas (evm : EvarMap.t) (Γ : context) (map : EMap.t (list nat)) 
   (nctx : named_context) (ev : evar) (subs args : list term) (body : term) : option (EMap.t (list nat) * term) :=
   (* We process the arguments from last to first. *)
-  let fix loop acc args : option (EMap.t (list nat) * term) :=
+  let fix loop (acc : EMap.t (list nat) * term) args : option (EMap.t (list nat) * term) :=
     match args with 
     | [] => ret acc 
     | arg :: args => 
+      let (map, body) := acc in
       (* TODO : remove [nf_evars] and add evar handling to the checker. *)
       (* TODO : use retyping instead of full typing here. *)
       mlet ty <-
@@ -497,7 +509,9 @@ Definition invert_lambdas (evm : EvarMap.t) (Γ : context) (map : EMap.t (list n
         end
       ;;
       mlet '(map, ty) <- invert evm map nctx ev subs (rev args) ty ;;
-      let binder := {| binder_name := nAnon ; binder_relevance := Relevant |} in
+      (* TODO : choose a fresh name. *)
+      let name := "x" ^ string_of_nat #|args| in
+      let binder := {| binder_name := nNamed name ; binder_relevance := Relevant |} in
       loop (map, tLambda binder ty body) args
     end 
   in 
@@ -522,7 +536,8 @@ Fixpoint prune (evm : EvarMap.t) (ev : nat) (pos : list nat) {struct ev} : optio
   (* Prune other evars as needed. *)
   mlet evm <- prune_all evm map tt ;;
   (* Create a fresh evar [ev'] in the new context. *)
-  let (evm, ev') := EvarMap.new_evar evm new_ctx concl in
+  let name' := entry.(ev_name) ^ "'" in
+  let (evm, ev') := EvarMap.new_evar evm name' new_ctx concl in
   (* Assign [ev := ev']. *)
   Some $ EvarMap.define evm ev' (tEvar ev new_ctx_vars)
 
@@ -643,7 +658,6 @@ with unify_tapp Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
 (** [try_instantiate] is called when either [t] or [t'] is an evar (possible applied
     to a suspended subsitution and arguments), and tries to apply rules which instantiate evars. *)
 with try_instantiate Γ pb t t' evm {struct pb} : M EvarMap.t :=
-  let* _ := log_str "Trying to instantiate evars." in
   let t := whd_tapp evm t in 
   let t' := whd_tapp evm t' in
   match t.1, t'.1 with 
@@ -651,10 +665,12 @@ with try_instantiate Γ pb t t' evm {struct pb} : M EvarMap.t :=
     if ev == ev' 
     (* Meta-Same *)
     then 
+      let* _ := log_str "Meta-Same" in
       let* evm := meta_same evm ev subs subs' in 
       ise_list2 (unify Γ Conv) t.2 t'.2 evm
     (* Meta-Meta *)
     else
+      let* _ := log_str "Meta-Meta" in
       (* We try both directions, but first the one with the longest substitution. *)
       let '(dir1, dir2, ev1, ev2, subs1, subs2, args1, args2, t1, t2) := 
         if #|subs| <? #|subs'|
@@ -664,9 +680,13 @@ with try_instantiate Γ pb t t' evm {struct pb} : M EvarMap.t :=
       meta_inst dir1 Γ pb ev1 subs1 args1 t1 evm <|> 
       meta_inst dir2 Γ pb ev2 subs2 args2 t2 evm
   (* Meta-InstL *)
-  | tEvar ev subs, _ => meta_inst Original Γ pb ev subs t.2 t' evm
+  | tEvar ev subs, _ => 
+    let* _ := log_str "Meta-InstL" in
+    meta_inst Original Γ pb ev subs t.2 t' evm
   (* Meta-InstR *)
-  | _, tEvar ev' subs' => meta_inst Swapped Γ pb ev' subs' t'.2 t evm
+  | _, tEvar ev' subs' => 
+    let* _ := log_str "Meta-InstR" in
+    meta_inst Swapped Γ pb ev' subs' t'.2 t evm
   | _, _ => failM $ InternalError "try_instantiate : expected an evar"
   end
 
@@ -693,11 +713,14 @@ with meta_inst dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :
       (meta_inst_solution Γ ev subs args t evm) 
       (InternalError "Failed to instantiate evar") 
     in
+    let* _ := log_doc $ str "solution :" ^+^ 
+      print_term PrettyFlags.default (Σ, Monomorphic_ctx) [] sol 
+    in
     (* Unify the type of the evar with the type of the solution (if the required flag is set). *)
     let* evm :=
       if UnifFlags.unify_types flags
       then 
-        let* entry := liftM (EvarMap.lookup evm ev) (InternalError "Undefined evar") in
+        let* entry := liftM (EvarMap.lookup evm ev) (InternalError "meta_inst : undefined evar") in
         let* sol_ty := 
           (* TODO : this should be retyping. *)
           match Checker.infer Σ (EvarMap.evm_universes evm) entry.(ev_nctx) [] sol with 
@@ -705,7 +728,7 @@ with meta_inst dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :
           | TypeError _ => failM $ InternalError "meta_inst : typecheck error"
           end 
         in
-        let* entry := liftM (EvarMap.lookup evm ev) (InternalError "Undefined evar") in
+        let* entry := liftM (EvarMap.lookup evm ev) (InternalError "meta_inst : undefined evar") in
         let ev_ty := instantiate_evar entry.(ev_nctx) subs entry.(ev_concl) in
         unify Γ Cumul sol_ty ev_ty evm
       else retM evm
@@ -717,12 +740,12 @@ with meta_inst dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :
   else failM NotSameHead
 
 with try_canonical_structures Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
-  let* _ := log_str "Trying canonical structure resolution." in
+  (*let* _ := log_str "Trying canonical structure resolution." in*)
   failM $ InternalError "try_canonical_structures : not implemented yet"
 
 (** [try_app_fo] tries to structurally unify the two sides of the equation. *)
 with try_app_fo Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
-  let* _ := log_str "App-FO." in
+  let* _ := log_str "App-FO" in
   let (f, args) := whd_tapp evm t in 
   let (f', args') := whd_tapp evm t' in
   if #|args| == #|args'| then 
@@ -883,3 +906,56 @@ End Algorithm.
 
 (****************************)
 (** Testing *)
+
+From MetaCoq.Template Require Import All.
+
+Definition env := fst ($quote_rec (nat, app, In)).
+
+Definition vass' (n : ident) (ty : term) : context_decl :=
+  vass {| binder_name := nNamed n ; binder_relevance := Relevant |} ty.
+
+Definition test := 
+  (* named context. *)
+  let y1 := "y1" in 
+  let y2 := "y2" in 
+  let Δy :=
+    [ (y1, vass' y1 ($quote nat))
+    ; (y2, vass' y2 ($quote nat)) ]
+  in 
+  (* evar map. *)
+  let evm := EvarMap.empty in 
+  let (evm, z0) := EvarMap.new_evar evm "z0" [] ($quote (nat -> nat -> list nat)) in
+  let (evm, z1) := EvarMap.new_evar evm "z1" [] ($quote (nat -> nat -> nat)) in
+  let (evm, z2) := EvarMap.new_evar evm "z2" [] ($quote (nat -> nat -> list nat)) in
+  (* terms to unify. *)
+  let t1 :=
+    mkApps ($quote In)
+      [ $quote nat
+      ; mkApps (tEvar z1 []) [tVar y1 ; tVar y2]
+      ; mkApps ($quote app) 
+        [ $quote nat 
+        ; mkApps (tEvar z0 []) [tVar y1 ; tVar y2]
+        ; mkApps (tEvar z2 []) [tVar y1 ; tVar y2] ] ]
+  in 
+  let singleton x := mkApps ($quote @cons) [$quote nat ; x ; $quote (@nil nat)] in
+  let t2 :=
+    mkApps ($quote In)
+    [ $quote nat 
+    ; tVar y1
+    ; mkApps ($quote app) 
+      [ $quote nat 
+      ; singleton (tVar y1)
+      ; singleton (tVar y2) ] ]
+  in
+  (* Unify the terms. *)
+  let (log, res) := @unify default_checker_flags env Δy [] Conv t1 t2 evm UnifFlags.default in
+  let log_str := pp_string 120 $ @Log.print PrettyFlags.default env log in
+  let res_str :=
+    match res with 
+    | Success evm => pp_string 120 $ EvarMap.print PrettyFlags.default (env, Monomorphic_ctx) evm
+    | UnifError _ => "error"%pstring
+    end 
+  in
+  (res_str, log_str).
+
+Eval vm_compute in test.

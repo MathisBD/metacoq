@@ -728,7 +728,12 @@ Section Typecheck.
       | None => raise (UnboundRel n)
       end
 
-    | tVar n => raise (UnboundVar n)
+    | tVar n => 
+      match lookup_nctx Δ n with 
+      | Some d => ret d.(decl_type)
+      | None => raise (UnboundVar n)
+      end
+      
     | tEvar ev args => raise (UnboundEvar ev)
 
     | tSort s => ret (tSort (Sort.super s))
