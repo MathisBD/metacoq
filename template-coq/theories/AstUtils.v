@@ -541,12 +541,12 @@ Definition fold_term_with_binders (f : A -> Acc -> term -> Acc) (acc : Acc) (t :
   | tProj proj t => f a acc t
   | tFix defs i => 
     let a_body := lift_names (List.map dname defs) a in
-    let acc := List.fold_left (f a) (List.map dtype defs) acc in 
-    List.fold_left (f a_body) (List.map dbody defs) acc
+    let acc := fold_left (fun acc d => f a acc d.(dtype)) defs acc in 
+    List.fold_left (fun acc d => f a_body acc d.(dbody)) defs acc
   | tCoFix defs i => 
     let a_body := lift_names (List.map dname defs) a in
-    let acc := List.fold_left (f a) (List.map dtype defs) acc in 
-    List.fold_left (f a_body) (List.map dbody defs) acc
+    let acc := fold_left (fun acc d => f a acc d.(dtype)) defs acc in 
+    List.fold_left (fun acc d => f a_body acc d.(dbody)) defs acc
   | tCase ci pred x branches => 
     let acc := fold_predicate_with_binders f acc pred in
     let acc := f a acc x in
@@ -562,7 +562,7 @@ End TraverseWithBinders.
 Section TraverseWithBindersM.
 Import MCMonadNotation.
 
-Context {M : Type -> Type} `{Monad M} {Acc : Type} {A : Type} {a : A} {liftM : aname -> A -> M A}. 
+Context {M : Type -> Type} `{Monad M} {Acc : Type} {A : Type} (a : A) (liftM : aname -> A -> M A). 
 
 Definition lift_namesM (names : list aname) (a : A) : M A :=
   let fix loop names a :=
@@ -681,12 +681,12 @@ Definition fold_term_with_bindersM (f : A -> Acc -> term -> M Acc) (acc : Acc) (
   | tProj proj t => f a acc t
   | tFix defs i => 
     mlet a_body <- lift_namesM (List.map dname defs) a ;;
-    mlet acc <- monad_fold_left (f a) (List.map dtype defs) acc ;;
-    monad_fold_left (f a_body) (List.map dbody defs) acc
+    mlet acc <- monad_fold_left (fun acc d => f a acc d.(dtype)) defs acc ;;
+    monad_fold_left (fun acc d => f a_body acc d.(dbody)) defs acc
   | tCoFix defs i => 
     mlet a_body <- lift_namesM (List.map dname defs) a ;;
-    mlet acc <- monad_fold_left (f a) (List.map dtype defs) acc ;;
-    monad_fold_left (f a_body) (List.map dbody defs) acc
+    mlet acc <- monad_fold_left (fun acc d => f a acc d.(dtype)) defs acc ;;
+    monad_fold_left (fun acc d => f a_body acc d.(dbody)) defs acc
   | tCase ci pred x branches => 
     mlet acc <- fold_predicate_with_bindersM f acc pred ;;
     mlet acc <- f a acc x ;;
