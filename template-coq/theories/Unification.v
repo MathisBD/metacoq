@@ -589,17 +589,16 @@ Definition intersect (flags : UnifFlags.t) evm (xs ys : list term) : option (lis
   loop 0 xs ys [].
           
 (** [meta_same evm ev subs1 subs2] implements the Meta-Same rule to unify [ev[subs1] =?= ev[subs2]]. *)
-(* TODO : better unif_errors. *)
 Definition meta_same evm (ev : evar) (subs1 subs2 : list term) : M EvarMap.t :=
   (* Check if the evar can be instantiated. *)
   let* flags := get_flags in
   if allowed_inst flags ev Both then 
     (* Prune the evar on the positions where [subs1] and [subs2] disagree. *)
     match intersect flags evm subs1 subs2 with
-    | Some [] => 
-      (* Fast path to avoid pruning if unnecessary. *) 
-      retM evm
-    | Some pos => prune evm ev pos
+    (* Meta-Same-Same *)
+    | Some [] => let* _ := log_str "Meta-Same-Same" in retM evm
+    (* Meta-Same *)
+    | Some pos => let* _ := log_str "Meta-Same" in prune evm ev pos
     | None => failM $ InternalError $ str "TODO"
     end
   else failM $ InternalError $ str "TODO".
@@ -680,12 +679,10 @@ with try_instantiate Γ pb t t' evm {struct pb} : M EvarMap.t :=
     if ev == ev' 
     (* Meta-Same *)
     then 
-      let* _ := log_str "Meta-Same" in
       let* evm := meta_same evm ev subs subs' in 
       ise_list2 (unify Γ Conv) t.2 t'.2 evm
     (* Meta-Meta *)
     else
-      let* _ := log_str "Meta-Meta" in
       (* We try both directions, but first the one with the longest substitution. *)
       let '(dir1, dir2, ev1, ev2, subs1, subs2, args1, args2, t1, t2) := 
         if #|subs| <? #|subs'|
@@ -693,19 +690,48 @@ with try_instantiate Γ pb t t' evm {struct pb} : M EvarMap.t :=
         else (Original, Swapped, ev, ev', subs, subs', t.2, t'.2, t', t)
       in 
       meta_inst dir1 Γ pb ev1 subs1 args1 t1 evm <|> 
-      meta_inst dir2 Γ pb ev2 subs2 args2 t2 evm
+      meta_inst dir2 Γ pb ev2 subs2 args2 t2 evm <|>
+      meta_fo   dir1 Γ pb ev1 subs1 args1 t1 evm <|>
+      meta_fo   dir2 Γ pb ev2 subs2 args2 t2 evm
   (* Meta-InstL *)
   | tEvar ev subs, _ => 
-    let* _ := log_str "Meta-InstL" in
-    meta_inst Original Γ pb ev subs t.2 t' evm
+    meta_inst Original Γ pb ev subs t.2 t' evm <|>
+    meta_fo   Original Γ pb ev subs t.2 t' evm
   (* Meta-InstR *)
   | _, tEvar ev' subs' => 
-    let* _ := log_str "Meta-InstR" in
-    meta_inst Swapped Γ pb ev' subs' t'.2 t evm
+    meta_inst Swapped Γ pb ev' subs' t'.2 t evm <|>
+    meta_fo   Swapped Γ pb ev' subs' t'.2 t evm
   | _, _ => failM $ InternalError $ str "try_instantiate : expected an evar"
   end
 
-(** [meta_inst dir Γ pb ev subs t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t].
+(** [meta_fo dir Γ pb ev subs args t evm] implements a first-order heuristic to 
+    unify [ev[subs] args] and [t]. This heuristic is similar to the rule App-FO
+    but slightly more general : it applies even if [t] has more arguments than [ev]. 
+    For instance it will split the problem [ev[subs] x1 x2 =?= f y1 y2 y3 y4] into
+    the subproblems [ev[subs] =?= f y1 y2], [x1 =?= y3] and [x2 =?= y4].  *)
+with meta_fo dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
+  (* Check if we are allowed to use this heuristic. *)
+  let* flags := get_flags in
+  let ev_side := match dir with Original => Left | Swapped => Right end in
+  if allowed_inst flags ev ev_side && 
+     (0 <? #|args|) && (* If the evar has no arguments, Meta-Inst will trigger. *)
+     (#|args| <? #|t.2|) (* If [t] and [ev] have the same number of arguments, App-FO will trigger. *)
+  then
+    let* _ := log_doc $ str "Meta-FO-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
+    (* Unify the heads and the arguments. As usual we check the arguments for 
+       convertibility [Conv] even when checking the applications for cumulativity [Cumul]. *)
+    let (t_args1, t_args2) := chop (#|t.2| - #|args|) t.2 in 
+    match dir with 
+    | Original =>
+      let* evm := unify_tapp Γ pb (tEvar ev subs, []) (t.1, t_args1) evm in
+      ise_list2 (unify Γ Conv) args t_args2 evm
+    | Swapped =>
+      let* evm := unify_tapp Γ pb (t.1, t_args1) (tEvar ev subs, []) evm in
+      ise_list2 (unify Γ Conv) t_args2 args evm
+    end
+  else failM NotSameHead
+
+(** [meta_inst dir Γ pb ev subs args t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t].
     [dir] is [Original] if [ev] is on the left-hand side, and [Swapped] if [ev] is on the right-hand side. *)
 (* TODO : better unif_errors. *)
 with meta_inst dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
@@ -723,6 +749,7 @@ with meta_inst dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :
      only variables (tVars and tRels). *)
   let side := match dir with Original => Left | Swapped => Right end in
   if allowed_inst flags ev side && List.forallb is_var (subs ++ args) then 
+    let* _ := log_doc $ str "Meta-Inst-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
     (* Compute the solution [sol]. *)
     let* (evm, sol) := meta_inst_solution Γ ev subs args t evm in
     let* _ := log_doc $ str "solution :" ^+^ 
@@ -836,7 +863,7 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     if cannot_reduce Left then failM CannotReduce else
     match t with 
     | (tLambda _ _ body, arg :: args) => 
-      let* _ := log_str "Lam-BetaL" in
+      let* _ := log_str "Lam-Beta-L" in
       unify_tapp Γ pb (subst0 [arg] body, args) t' evm
     | _ => failM CannotReduce
     end
@@ -846,7 +873,7 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     if cannot_reduce Right then failM CannotReduce else
     match t' with 
     | (tLambda _ _ body', arg' :: args') => 
-      let* _ := log_str "Lam-BetaR" in
+      let* _ := log_str "Lam-Beta-R" in
       unify_tapp Γ pb t (subst0 [arg'] body', args') evm
     | _ => failM CannotReduce
     end
@@ -856,7 +883,7 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     if cannot_reduce Left then failM CannotReduce else 
     match t with 
     | (tLetIn _ def _ body, args) =>
-      let* _ := log_str "Let-ZetaL" in
+      let* _ := log_str "Let-Zeta-L" in
       unify_tapp Γ pb (subst0 [def] body, args) t' evm
     | _ => failM CannotReduce
     end
@@ -866,7 +893,7 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     if cannot_reduce Right then failM CannotReduce else 
     match t' with 
     | (tLetIn _ def' _ body', args') =>
-      let* _ := log_str "Let-ZetaR" in
+      let* _ := log_str "Let-Zeta-R" in
       unify_tapp Γ pb t (subst0 [def'] body', args') evm
     | _ => failM CannotReduce
     end
@@ -875,14 +902,14 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
   let cons_deltaL :=
     if cannot_reduce Left then failM CannotReduce else 
     let* def := liftM (unfold_def Γ t.1 evm) CannotReduce in 
-    let* _ := log_str "Cons-DeltaL" in 
+    let* _ := log_str "Cons-Delta-L" in 
     unify_tapp Γ pb (def, t.2) t' evm
   in
   (* Cons-DeltaR *)
   let cons_deltaR :=
     if cannot_reduce Right then failM CannotReduce else 
     let* def' := liftM (unfold_def Γ t'.1 evm) CannotReduce in 
-    let* _ := log_str "Cons-DeltaR" in 
+    let* _ := log_str "Cons-Delta-R" in 
     unify_tapp Γ pb t (def', t'.2) evm
   in
   (* Lam-EtaL *)
@@ -891,7 +918,7 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     match t, t' with
     | _, (tLambda _ _ _, _) => failM CannotReduce 
     | (tLambda x ty body, []), _ =>
-      let* _ := log_str "Lam-EtaL" in
+      let* _ := log_str "Lam-Eta-L" in
       eta_match Original Γ pb (x, ty, body) (mkApps t'.1 t'.2) evm
     | _, _ => failM CannotReduce
     end
@@ -902,7 +929,7 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     match t, t' with
     | (tLambda _ _ _, _), _ => failM CannotReduce 
     | _, (tLambda x' ty' body', []) =>
-      let* _ := log_str "Lam-EtaR" in
+      let* _ := log_str "Lam-Eta-R" in
       eta_match Swapped Γ pb (x', ty', body') (mkApps t.1 t.2) evm
     | _, _ => failM CannotReduce
     end
