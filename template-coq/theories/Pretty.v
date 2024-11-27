@@ -30,6 +30,8 @@ Record t := mk
         (only relevant when printing declarations) *)
     full_defs : bool }.
 
+Existing Class t.
+
 (** Default flags : don't print any low-level details. *)
 Definition default : t := mk false false false false false false.
   
@@ -96,7 +98,7 @@ Fixpoint filter_mask {A} (xs : list A) (bs : list bool) : list A :=
     The identifier [id_i] is the name associated to the de Bruijn index [i]. *)
 
 Section Printing.
-Context (flags : PrettyFlags.t).
+Context {flags : PrettyFlags.t}.
 
 Section Env.
 Context (env : global_env_ext).
@@ -552,4 +554,3 @@ Definition print_env (env : global_env) : doc unit :=
   loop env.(declarations) [].
 
 End Printing.
-

@@ -93,10 +93,10 @@ Record evar_entry :=
     ev_def : option term }.
 
 (** Pretty-print an evar entry. *)
-Definition print_evar_entry (flags : PrettyFlags.t) (env : global_env_ext) (ev_id : evar) (ev : evar_entry) : doc unit :=
+Definition print_evar_entry `{PrettyFlags.t} (env : global_env_ext) (ev_id : evar) (ev : evar_entry) : doc unit :=
   let header := bstr ev.(ev_name) ^^ str "#" ^^ nat10 ev_id in
-  let concl := str ":" ^+^ print_term flags env [] ev.(ev_concl) in
-  let def := option_map (fun d => str ":=" ^+^ print_term flags env [] d) ev.(ev_def) in
+  let concl := str ":" ^+^ print_term env [] ev.(ev_concl) in
+  let def := option_map (fun d => str ":=" ^+^ print_term env [] d) ev.(ev_def) in
   match def with 
   | None => header ^+^ concl 
   | Some def => header ^+^ align $ group $ concl ^/^ def
@@ -113,16 +113,16 @@ Module EvarMap.
 Record t := 
   { (** A map from evars to evar entries. *)
     evm_map : EMap.t evar_entry
-  ; (** A counter used to generate fresh evars. *)
+  ; (** A counter used to generate fresh evars and fresh universe levels. *)
     evm_counter : nat
   ; (** The universe graph. *)
     evm_universes : universes_graph }.
 
 (** Pretty-print an evar map. *)
-Definition print (flags : PrettyFlags.t) (env : global_env_ext) (evm : t) : doc unit :=
+Definition print `{PrettyFlags.t} (env : global_env_ext) (evm : t) : doc unit :=
   (* Print the evar entries. *)
   let evars := 
-    separate_map hardline (fun '(ev, entry) => print_evar_entry flags env ev entry) $ 
+    separate_map hardline (fun '(ev, entry) => print_evar_entry env ev entry) $ 
       EMap.elements evm.(evm_map) 
   in
   (* TODO : print the universe constraints. *)
@@ -175,9 +175,43 @@ Definition define (evm : t) (ev : evar) (def : term) : t :=
     ;  evm_universes := evm.(evm_universes) |}
   end.
 
-(** [new_evar evm name nctx concl] creates a new evar with name [name] and conclusion [concl] 
-    in named context [nctx], and adds it to the evar map [evm]. *)
-Definition new_evar (evm : t) (name : ident) (nctx : named_context) (concl : term) : (t * evar) :=
+(** [map_option f xs] applies [f] to each element in [xs], and discards all the elements
+    that get mapped to [None]. *)
+Fixpoint map_option {A B} (f : A -> option B) (xs : list A) : list B :=
+  match xs with 
+  | [] => [] 
+  | x :: xs =>
+    match f x with 
+    | None => map_option f xs 
+    | Some y => y :: map_option f xs 
+    end 
+  end. 
+
+(** [fresh_universe evm] generates a fresh universe and adds it to the evar map's
+    universe graph. *)
+Definition fresh_universe (evm : t) : t * Universe.t :=
+  (* Choose a fresh name for the universe level. *)
+  let id := "MetaCoq.Evars.EvarMap.Univ" ^ string_of_nat evm.(evm_counter) in 
+  (* Update the evar map. *)
+  let evm := 
+    {| evm_map := evm.(evm_map)
+    ;  evm_counter := S evm.(evm_counter)
+    ;  evm_universes := wGraph.add_node evm.(evm_universes) (Level.level id) |}
+  in 
+  (evm, Universe.make' $ Level.level id).
+  
+(** [fresh_evar evm name nctx concl] creates a new evar :
+    - with a fresh name chosen from [name].
+    - with conclusion [concl].
+    - in named context [nctx].
+    and and adds it to the evar map [evm]. *)
+Definition fresh_evar (evm : t) (basename : ident) (nctx : named_context) (concl : term) : (t * evar) :=
+  (* Generate a fresh name for the evar. *)
+  let evar_names := 
+    IdentSetProp.of_list $ map (fun '(_, e) => e.(ev_name)) $ EMap.elements evm.(evm_map) 
+  in
+  let name := fresh_ident basename evar_names in
+  (* Create the evar entry. Initially the evar is not defined. *)
   let entry := 
     {| ev_name := name 
     ;  ev_nctx := nctx 

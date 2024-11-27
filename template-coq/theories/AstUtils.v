@@ -717,3 +717,24 @@ Definition fold_term {Acc} (f : Acc -> term -> Acc) (acc : Acc) (t : term) : Acc
 (** Monadic variant of [fold_term]. *)
 Definition fold_termM {M} `{Monad M} {Acc} (f : Acc -> term -> M Acc) (acc : Acc) (t : term) : M Acc :=
   @fold_term_with_bindersM M _ Acc unit tt (fun _ _ => ret tt) (fun _ => f) acc t.
+
+(** * Fresh name generation. *)
+
+(** [fresh_ident base avoid] generates a fresh identifier from a template [base]
+    and that is not in the set [avoid]. *)
+Definition fresh_ident (base : ident) (avoid : IdentSet.t) : ident :=
+  (* First try without a suffix. *)
+  if negb (IdentSet.mem base avoid) then base else 
+  (* Otherwise try with a numerical suffix. *)
+  let fix loop fuel i : string :=
+    match fuel with 
+    | S fuel => 
+      let id := base ^ string_of_nat i in
+      if IdentSet.mem id avoid
+      then loop fuel (S i)
+      else id
+    (* This case should never happen. *) 
+    | 0 => base
+    end 
+  in 
+  loop (IdentSet.cardinal avoid) 0.
