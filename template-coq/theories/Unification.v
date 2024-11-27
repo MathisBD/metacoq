@@ -67,7 +67,9 @@ Inductive direction := Original | Swapped.
 Module UnifFlags.
 Record t := mk
   { beta_reduce_type : bool
-  ; unify_types : bool 
+  ; (** When unifying an evar with a term, should we unify the type of the evar
+        with the type of the term ? *)
+    unify_types : bool 
   ; aggressive : bool
   ; super_aggressive : bool 
   ; try_solving_eqn : bool 
@@ -81,6 +83,29 @@ Record t := mk
 
 (** Reasonable default flags. *)
 Definition default := mk true true true false true Both Both None.
+
+(** Modify the [reduce_side] in some flags. *)
+Definition set_reduce_side (s : Side.t) (flags : t) : t :=
+  {| beta_reduce_type := flags.(beta_reduce_type) 
+  ;  unify_types      := flags.(unify_types) 
+  ;  aggressive       := flags.(aggressive)
+  ;  super_aggressive := flags.(super_aggressive) 
+  ;  try_solving_eqn  := flags.(try_solving_eqn) 
+  ;  reduce_side      := s 
+  ;  inst_side        := flags.(inst_side)
+  ;  inst_evars       := flags.(inst_evars) |}.
+  
+(** Modify the [inst_side] in some flags. *)
+Definition set_inst_side (s : Side.t) (flags : t) : t :=
+  {| beta_reduce_type := flags.(beta_reduce_type) 
+  ;  unify_types      := flags.(unify_types) 
+  ;  aggressive       := flags.(aggressive)
+  ;  super_aggressive := flags.(super_aggressive) 
+  ;  try_solving_eqn  := flags.(try_solving_eqn) 
+  ;  reduce_side      := flags.(reduce_side) 
+  ;  inst_side        := s
+  ;  inst_evars       := flags.(inst_evars) |}.  
+
 End UnifFlags.
 
 (** * Unification errors. *)
@@ -618,20 +643,18 @@ Definition meta_inst_solution Γ (ev : evar) (subs args : list term) (t : term) 
   (* TODO : refresh universes. *)
   retM (evm, t1).
 
-(** [unfold_def Γ t evm] gets the definition of a local variable or constant. *)
+(** [unfold_def Γ t evm] unfolds the definition of a local variable (tRel or tVar) or constant. *)
 Definition unfold_def Γ t evm : option term :=
   match whd_evars evm t with 
   | tRel n => 
     match decl_body =<< List.nth_error Γ n with 
     | Some body => Some $ lift0 (S n) body
-    | _ => None 
+    | None => None 
     end 
   | tVar id => decl_body =<< lookup_nctx Δ id
   | tConst c uinst =>
     match cst_body =<< lookup_constant Σ c with 
-    | Some body => 
-      (* TODO : substitute the instance. *)
-      Some body
+    | Some body => Some $ subst_instance uinst body
     | None => None 
     end
   | _ => None 
@@ -714,8 +737,10 @@ with meta_fo dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
   let* flags := get_flags in
   let ev_side := match dir with Original => Left | Swapped => Right end in
   if allowed_inst flags ev ev_side && 
-     (0 <? #|args|) && (* If the evar has no arguments, Meta-Inst will trigger. *)
-     (#|args| <? #|t.2|) (* If [t] and [ev] have the same number of arguments, App-FO will trigger. *)
+     (* If the evar has no arguments, Meta-Inst will trigger. *)
+     (0 <? #|args|) && 
+     (* We allow [t] and [ev] to have the same number of arguments to be more general than App-FO. *)
+     (#|args| <=? #|t.2|) 
   then
     let* _ := log_doc $ str "Meta-FO-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
     (* Unify the heads and the arguments. As usual we check the arguments for 
@@ -735,23 +760,23 @@ with meta_fo dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
     [dir] is [Original] if [ev] is on the left-hand side, and [Swapped] if [ev] is on the right-hand side. *)
 (* TODO : better unif_errors. *)
 with meta_inst dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
-  (* TODO : allow reduction and instantitation in all subproblems. *)
-  (*let flags := UnifFlags.mk  Both Both (UnifFlags.inst_evars up) in
-  with_flags flags $*)
-  let* flags := get_flags in
-  (* Beta-reduce [t] if the relevant flag is set. *)
-  (* TODO *)
-  let t := tApp t.1 t.2 in
   let is_var t := 
     match whd_evars evm t with tVar _ | tRel _ => true | _ => false end 
   in
   (* Check the evar is instantiable and that the substitution and arguments contain 
      only variables (tVars and tRels). *)
   let side := match dir with Original => Left | Swapped => Right end in
+  let* flags := get_flags in
   if allowed_inst flags ev side && List.forallb is_var (subs ++ args) then 
     let* _ := log_doc $ str "Meta-Inst-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
+    (* Allow reduction and instantiation on both sides in subproblems. *)
+    let flags := 
+      UnifFlags.set_reduce_side Both $
+      UnifFlags.set_inst_side Both flags
+    in
+    with_flags flags $  
     (* Compute the solution [sol]. *)
-    let* (evm, sol) := meta_inst_solution Γ ev subs args t evm in
+    let* (evm, sol) := meta_inst_solution Γ ev subs args (mkApps t.1 t.2) evm in
     let* _ := log_doc $ str "solution :" ^+^ 
       print_term (Σ, Monomorphic_ctx) [] sol 
     in
@@ -948,8 +973,8 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     where [?body : Type] is a fresh evar. *)
 with check_product Γ (t : term) (x_ty : aname * term) evm {struct t} : M EvarMap.t :=
   let (x, ty) := x_ty in
-  (* Create a fresh universe. *)
-  let (evm, univ) := EvarMap.fresh_universe evm in
+  (* Create a fresh universe level for the type of the body. *)
+  let (evm, lvl) := EvarMap.fresh_level evm in
   (* Extend the ambient named context Δ with a declaration for the argument [x : ty] of the product. *)
   let id' := 
     fresh_ident 
@@ -959,7 +984,7 @@ with check_product Γ (t : term) (x_ty : aname * term) evm {struct t} : M EvarMa
   let x' := {| binder_name := nNamed id' ; binder_relevance := x.(binder_relevance) |} in
   let ev_nctx := (id', vass x' ty) :: Δ in
   (* Create the body of the product. *)
-  let (evm, ev) := EvarMap.fresh_evar evm "body" ev_nctx (tSort $ sType univ) in
+  let (evm, ev) := EvarMap.fresh_evar evm "body" ev_nctx (tSort $ sType $ Universe.make' lvl) in
   let body := tEvar ev (tRel 0 :: List.map (tVar <<< fst) Δ) in
   (* Unify [t <=? forall x : ty, ?body]. *)
   unify Γ Cumul t (tProd x ty body) evm
@@ -973,7 +998,12 @@ with eta_match dir Γ pb (x_ty_body : aname * term * term) (t' : term) evm {stru
   let* evm := check_product Γ ty' (x, ty) evm in 
   (* Lift [t'] and apply it to [tRel 0]. *)
   let t'' := mkApp (lift0 1 t') (tRel 0) in
-  (* Unify [body =?= t'']. *)
+  (* Unify [body =?= t'']. 
+     Note that it is not strictly necessary to preserve the direction of the equation for
+     eta expansion : indeed on terms which are not types [Conv] and [Cumul] coincide, 
+     and a lambda abstraction is never a type.
+     For consistency I choose to anyways preserve the direction (it should also
+     make the code more robust to future changes). *)
   match dir with 
   | Original => unify (Γ ,, vass x ty) pb body t'' evm
   | Swapped => unify (Γ ,, vass x ty) pb t'' body evm
@@ -1023,3 +1053,10 @@ Definition test :=
   (res_str, log_str).
 
 Eval vm_compute in test.
+
+(* TODO : 
+- adapt the Checker to handle evars.
+- better unif error messages + support for printing them 
+- meta_inst_solution : beta reduce heuristic + remove equal tails
+- fix generation of universe constraints
+*)

@@ -187,9 +187,9 @@ Fixpoint map_option {A B} (f : A -> option B) (xs : list A) : list B :=
     end 
   end. 
 
-(** [fresh_universe evm] generates a fresh universe and adds it to the evar map's
+(** [fresh_level evm] generates a fresh universe level and adds it to the evar map's
     universe graph. *)
-Definition fresh_universe (evm : t) : t * Universe.t :=
+Definition fresh_level (evm : t) : t * Level.t :=
   (* Choose a fresh name for the universe level. *)
   let id := "MetaCoq.Evars.EvarMap.Univ" ^ string_of_nat evm.(evm_counter) in 
   (* Update the evar map. *)
@@ -198,8 +198,20 @@ Definition fresh_universe (evm : t) : t * Universe.t :=
     ;  evm_counter := S evm.(evm_counter)
     ;  evm_universes := wGraph.add_node evm.(evm_universes) (Level.level id) |}
   in 
-  (evm, Universe.make' $ Level.level id).
+  (evm, Level.level id).
   
+(** [fresh_levels evm n] generates [n] fresh universe levels and adds them 
+    to the evar map's universe graph. *)
+Fixpoint fresh_levels (evm : t) (n : nat) : t * list Level.t :=
+  match n with 
+  | 0 => (evm, [])
+  | S n => 
+    let (evm, l) := fresh_level evm in
+    let (evm, ls) := fresh_levels evm n in
+    (evm, l :: ls)
+  end.
+  
+
 (** [fresh_evar evm name nctx concl] creates a new evar :
     - with a fresh name chosen from [name].
     - with conclusion [concl].
@@ -229,8 +241,7 @@ Definition fresh_evar (evm : t) (basename : ident) (nctx : named_context) (concl
 
 (** [add_univ_constraints evm cstrs] adds universe constraints [cstrs] to the evar map [evm].
     It returns [None] if the added constraints are inconsistent. *)
-Definition add_univ_constraints `{cf : checker_flags} (evm : EvarMap.t) 
-  (cstrs : ConstraintSet.t) : option EvarMap.t :=
+Definition add_univ_constraints (evm : EvarMap.t) (cstrs : ConstraintSet.t) : option EvarMap.t :=
   let universes :=
     ConstraintSet.fold 
       (fun cstr ugraph => 
@@ -253,12 +264,12 @@ Definition add_univ_constraints `{cf : checker_flags} (evm : EvarMap.t)
 
 (** [set_eq_sort evm s1 s2] adds constraints to [evm] to enforce [s1 = s1].
     It returns [None] if the added constraints are inconsistent. *)
-Definition set_eq_sort `{cf : checker_flags} (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
+Definition set_eq_sort (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
   add_univ_constraints evm =<< sort_eq_constraints s1 s2.
 
 (** [set_leq_sort evm s1 s2] adds constraints to [evm] to enforce [s1 <= s1].
     It returns [None] if the added constraints are inconsistent. *)
-Definition set_leq_sort `{cf : checker_flags} (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
+Definition set_leq_sort (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
     add_univ_constraints evm =<< sort_leq_constraints s1 s2.
 
 End EvarMap.
@@ -307,4 +318,25 @@ Fixpoint whd_evars (evm : EvarMap.t) (t : term) {struct t} : term :=
     | _ => t 
     end 
   | t => t 
+  end.
+
+(** [fresh_univ_instance evm udecl] creates a fresh universe instance
+    corresponding to universe declaration [udecl], and adds the new levels
+    and constraints to the evar map.
+    
+    This assumes the constraints in [udecl] are consistent. *)
+Definition fresh_univ_instance (evm : EvarMap.t) (udecl : universes_decl) : EvarMap.t * Instance.t :=
+  match udecl with 
+  | Monomorphic_ctx => (evm, [])
+  | Polymorphic_ctx (names, cstrs) =>
+    (* Create fresh levels. *)
+    let (evm, lvls) := EvarMap.fresh_levels evm #|names| in
+    (* Add the universe constraints to the evar map. 
+       Don't forget to translate the constraints so that they speak of the fresh levels
+       instead of abstract universe levels. *)
+    match EvarMap.add_univ_constraints evm (subst_instance lvls cstrs) with 
+    | Some evm => (evm, lvls)
+    (* This should not happen : we assume the constraints of [udecl] are consistent. *)
+    | None => (evm, []) 
+    end
   end.
