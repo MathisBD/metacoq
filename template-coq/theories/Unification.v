@@ -1,18 +1,18 @@
 (* Distributed under the terms of the MIT license. *)
 
-(** This file defines a unification algorithm inspired by Unicoq :
-    "A Unification Algorithm for COQ Featuring Universe Polymorphism and Overloading"
-    https://github.com/unicoq
-
-    It is intended for practical use and is not verified 
-    (we even disable the guard checker). *)
-
 From MetaCoq.Utils Require Import utils.
 From MetaCoq.Common Require Import BasicAst uGraph config.
-From MetaCoq.Template Require Import Ast AstUtils Typing Checker Evars Pretty.
+From MetaCoq.Template Require Import Ast AstUtils Typing Checker Retyping Evars Pretty.
 Import MCMonadNotation.
 
 Unset Guard Checking.
+
+(** This file defines a unification algorithm inspired by Unicoq :
+    "A Unification Algorithm for COQ Featuring Universe Polymorphism and Overloading"
+    https://github.com/unicoq
+    
+    It is intended for practical use and is not verified 
+    (we even disable the guard checker). *)
 
 (** A convenient notation for function application, which saves many parentheses. *)
 Notation "f $ x" := (f x) 
@@ -483,19 +483,17 @@ Section Algorithm.
 Context `{PrettyFlags.t} `{checker_flags} (Σ : global_env) (Δ : named_context).
 
 Implicit Types (Γ : context) (up : UnifFlags.t) (pb : conv_pb).
-Existing Instance default_fuel.
+Existing Instance Checker.default_fuel.
 
 (** [type_of evm Δ Γ t] computes the type of term [t] in named context [Δ] and local context [Γ].
     It assumes that [t] is well-typed. *)
 Definition type_of (evm : EvarMap.t) (Δ : named_context) (Γ : context) (t : term) : M term :=
-  (* TODO : actually use retyping. *)
-  (* TODO : integrate evar map handling in [Checker] and get rid of [nf_evars]. *)
-  match Checker.infer Σ (EvarMap.evm_universes evm) Δ Γ $ nf_evars evm t with 
+  match retype evm Σ Δ Γ t with 
   | Checked ty => retM ty 
   | TypeError err => 
     failM $
       str "The term" ^/^ 
-      print_term (Σ, Monomorphic_ctx) (context_names Γ) (nf_evars evm t) ^/^
+      print_term (Σ, Monomorphic_ctx) (context_names Γ) t ^/^
       str "is ill-typed." 
   end.
 
@@ -590,8 +588,7 @@ Definition intersect (flags : UnifFlags.t) evm (xs ys : list term) : option (lis
     match xs, ys with 
     | [], [] => Some diff
     | x :: xs, y :: ys =>
-      (* TODO : push evar handling in [eq_term]. *)
-      if eq_term (EvarMap.evm_universes evm) (nf_evars evm x) (nf_evars evm y) then loop (S i) xs ys diff 
+      if eq_term_evars evm x y then loop (S i) xs ys diff 
       else if is_var x && is_var y then loop (S i) xs ys (i :: diff)
       else if UnifFlags.aggressive flags then loop (S i) xs ys (i :: diff)
       else None
@@ -1063,7 +1060,6 @@ Definition test :=
 Eval vm_compute in test.
 
 (* TODO : 
-- adapt the Checker to handle evars.
 - meta_inst_solution : beta reduce heuristic + remove equal tails
 - fix generation of universe constraints
 - add controlled backtracking

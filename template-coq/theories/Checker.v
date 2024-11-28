@@ -40,11 +40,13 @@ Inductive type_error :=
 | UndeclaredConstant (c : kername)
 | UndeclaredInductive (c : inductive)
 | UndeclaredConstructor (c : inductive) (i : nat)
+| UndeclaredProjection (p : projection)
 | NotConvertible (Γ : context) (t u t' u' : term)
 | NotASort (t : term)
 | NotAProduct (t t' : term)
 | NotAnInductive (t : term)
 | IllFormedFix (m : mfixpoint term) (i : nat)
+| IllFormedProjection (p : projection) (t : term)
 | UnsatisfiedConstraints (c : ConstraintSet.t)
 | UnsatisfiableConstraints (c : ConstraintSet.t)
 | NotEnoughFuel (n : nat)
@@ -58,7 +60,8 @@ Definition string_of_type_error (e : type_error) : string :=
   | UnboundEvar ev => "Unbound evar " ^ string_of_nat ev
   | UndeclaredConstant c => "Undeclared constant " ^ string_of_kername c
   | UndeclaredInductive c => "Undeclared inductive " ^ string_of_kername (inductive_mind c)
-  | UndeclaredConstructor c i => "Undeclared inductive " ^ string_of_kername (inductive_mind c)
+  | UndeclaredConstructor c i => "Undeclared constructor for inductive " ^ string_of_kername (inductive_mind c)
+  | UndeclaredProjection p => "Undeclared projection for for inductive " ^ string_of_kername (inductive_mind p.(proj_ind))
   | NotConvertible Γ t u t' u' => "Terms are not convertible: " ^
       string_of_term t ^ " " ^ string_of_term u ^ " after reduction: " ^
       string_of_term t' ^ " " ^ string_of_term u'
@@ -66,6 +69,7 @@ Definition string_of_type_error (e : type_error) : string :=
   | NotAProduct t t' => "Not a product"
   | NotAnInductive t => "Not an inductive"
   | IllFormedFix m i => "Ill-formed recursive definition"
+  | IllFormedProjection p t => "Ill-formed primitive projection"
   | UnsatisfiedConstraints c => "Unsatisfied constraints"
   | UnsatisfiableConstraints c => "Unsatisfiable constraints"
   | NotEnoughFuel n => "Not enough fuel"
@@ -135,31 +139,35 @@ Section Lookups.
     ret (subst_instance u (snd res).(ind_type)).
 
   Definition lookup_ind_type_cstrs ind i (u : list Level.t) :=
-    res <- lookup_ind_decl ind i ;;
-    let '(mib, body) := res in
+    '(mib, body) <- lookup_ind_decl ind i ;;
     let uctx := mib.(ind_universes) in
     let cstrs := polymorphic_constraints uctx in
     ret (subst_instance u body.(ind_type), subst_instance_cstrs u cstrs).
 
   Definition lookup_constructor_decl ind i k :=
-    res <- lookup_ind_decl ind i;;
-    let '(mib, body) := res in
+    '(mib, body) <- lookup_ind_decl ind i;;
     match nth_error body.(ind_ctors) k with
     | Some cdecl => ret (mib, cdecl)
     | None => raise (UndeclaredConstructor (mkInd ind i) k)
     end.
 
   Definition lookup_constructor_type ind i k u :=
-    res <- lookup_constructor_decl ind i k ;;
-    let '(mib, cdecl) := res in
+    '(mib, cdecl) <- lookup_constructor_decl ind i k ;;
     ret (subst0 (inds ind u mib.(ind_bodies)) (subst_instance u cdecl.(cstr_type))).
 
   Definition lookup_constructor_type_cstrs ind i k u :=
-    res <- lookup_constructor_decl ind i k ;;
-    let '(mib, cdecl) := res in
+    '(mib, cdecl) <- lookup_constructor_decl ind i k ;;
     let cstrs := polymorphic_constraints mib.(ind_universes) in
     ret (subst0 (inds ind u mib.(ind_bodies)) (subst_instance u cdecl.(cstr_type)),
         subst_instance_cstrs u cstrs).
+
+  Definition lookup_projection_type p c args u :=
+    match lookup_projection Σ p with
+    | Some (_, _, _, pbody) =>
+      ret (subst0 (c :: rev args) (subst_instance u pbody.(proj_type)))
+    | None => raise (UndeclaredProjection p)
+    end.
+
 End Lookups.
 
 Section Reduce.
@@ -797,10 +805,18 @@ Section Typecheck.
 
     | tProj p c =>
       ty <- infer Γ c ;;
-      indargs <- reduce_to_ind Σ Δ Γ ty ;;
-      (* FIXME *)
-      ret ty
-
+      '(ind, u, args) <- reduce_to_ind Σ Δ Γ ty ;;
+      match lookup_projection Σ p with 
+      | Some (mbody, ibody, _, pbody) =>
+        if (eq_inductive ind p.(proj_ind)) &&
+           (#|args| == p.(proj_npars)) && 
+           (mbody.(ind_npars) == p.(proj_npars)) &&
+           (nth_error ibody.(ind_projs) p.(proj_arg) == Some pbody) 
+        then ret (subst0 (c :: rev args) (subst_instance u pbody.(proj_type)))
+        else raise (IllFormedProjection p c)
+      | None => raise (UndeclaredProjection p)
+      end
+    
     | tFix mfix n =>
       match nth_error mfix n with
       | Some f => ret f.(dtype)
@@ -815,7 +831,7 @@ Section Typecheck.
 
     | tInt _ | tFloat _ | tString _ | tArray _ _ _ _ => raise (NotSupported "primitive types")
     end.
-
+  
   Definition check (Γ : context) (t : term) (ty : term) : typing_result unit :=
     infer Γ ty ;;
     infer_cumul infer Γ t ty ;;

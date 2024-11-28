@@ -18,10 +18,11 @@ theories/Reduction.v
 theories/TypingWf.v
 theories/Normal.v
 theories/WcbvEval.v
-theories/Evars.v
 theories/Checker.v
 theories/EtaExpand.v
 theories/TemplateProgram.v
+theories/Evars.v
+theories/Retyping.v
 
 # The Template monad
 theories/TemplateMonad.v
