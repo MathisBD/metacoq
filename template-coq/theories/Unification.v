@@ -658,6 +658,122 @@ Fixpoint whd_tapp evm (t : tapp) {struct t} : tapp :=
   | f' => (f', args)
   end.
 
+(** [reduce_theta_tapp evm Γ t] weak-head reduces [t] using all reduction rules except unfolding 
+    (i.e. beta, zeta, iota, evar-expansion, cast-erasure).
+    Additionnally, it tries to reduce match scrutinees and fixpoint recursive arguments 
+    using _all_ rules (including unfolding), if it allows a iota reduction to trigger
+    (this is the theta rule in the Unicoq paper).
+    
+    It uses a call-by-name reduction strategy (i.e. it does not reduce arguments before 
+    substituting them). *)
+Definition reduce_theta_tapp (evm : EvarMap.t) (Γ : context) (t : tapp) : tapp :=
+  (* This is a standard stack-based reduction machine. The flag [inside_arg] controls whether 
+     we are inside a match scrutinee or fixpoint argument. *)
+  let fix loop (inside_arg : bool) (t : tapp) {struct t} : tapp := 
+    match whd_tapp evm t with
+    
+    (* Delta-Γ reduction. *)
+    | (tRel n, args) => 
+      match inside_arg, nth_error Γ n with 
+      | true, Some {| decl_body := Some body |} => 
+        loop inside_arg (lift0 (S n) body, args)
+      | _, _ => (tRel n, args)
+      end
+    
+    (* Delta-Δ reduction. *)
+    | (tVar id, args) =>
+      match inside_arg, lookup_nctx Δ id with 
+      | true, Some {| decl_body := Some body |} => 
+        loop inside_arg (body, args)
+      | _, _ => (tVar id, args) 
+      end
+    
+    (* Delta-Σ reduction. *)
+    | (tConst c u, args) =>
+      match inside_arg, lookup_constant Σ c with 
+      | true, Some {| cst_body := Some body |} => 
+        loop inside_arg (subst_instance u body, args)
+      | _, _ => (tConst c u, args)
+      end  
+    
+    (* Beta reduction. *)
+    | (tLambda _ _ body, arg :: args) => loop inside_arg (subst0 [arg] body, args)
+    
+    (* Zeta-reduction. *)
+    | (tLetIn _ def _ body, args) => loop inside_arg (subst0 [def] body, args)
+    
+    (* Match-reduction. *)
+    | (tCase ci pred x bs, args) =>
+      (* If the (reduced) scrutinee is a constructor, reduce the match. *)
+      match loop true (x, []) with
+      | (tConstruct ind n _, x_args) =>
+        match nth_error bs n, lookup_constructor Σ ind n with
+        | Some branch, Some (mbody, _, cbody) =>
+          let bctx := case_branch_context ind mbody cbody pred branch in
+          loop inside_arg (iota_red ci.(ci_npar) x_args bctx branch, args)
+        | _, _ => (tCase ci pred x bs, args)
+        end
+      | _ => (tCase ci pred x bs, args)
+      end
+
+    (* Fix-reduction. *)
+    | (tFix mfix n, args) =>
+      (* Get the body of the fixpoint. *)
+      match unfold_fix mfix n with 
+      | Some (rec_idx, fix_body) =>
+        match chop rec_idx args with 
+        (* We have enough arguments to reduce. *)
+        | (args1, ra :: args2) =>
+          (* If the (reduced) recursive fixpoint argument is a constructor,
+             reduce the fixpoint. *)
+          match loop true (ra, []) with 
+          | (tConstruct _ _ _ as ra, ra_args) => 
+            loop inside_arg (fix_body, args1 ++ mkApps ra ra_args :: args2)
+          | _ => (tFix mfix n, args)
+          end
+        (* We don't have enough arguments to reduce. *)
+        | (args, []) => (tFix mfix n, args)
+        end 
+      | None => (tFix mfix n, args)
+      end
+
+    (* CoFix-Reduction. *)
+    | (tCoFix mfix n, args) =>
+      (* Get the body of the co-fixpoint. *)
+      match unfold_fix mfix n with 
+      | Some (_, cofix_body) => 
+        (* For co-fixpoints we don't need to wait for the recursive argument to be a constructor. *)
+        loop inside_arg (cofix_body, args) 
+      | None => (tFix mfix n, args)
+      end
+
+    (* No applicable rule. Note that evar-expansion and cast-erasure are done by [whd_tapp]. *)
+    | t => t
+    end
+  in
+  loop true t.
+
+(** [is_stuck evm Γ t] determines if [t] is stuck, in the sense that reducing it
+    is useless. This is used to implement controlled backtracking. *)
+Definition is_stuck (evm : EvarMap.t) (Γ : context) (t : tapp) : bool :=
+  let t := whd_tapp evm t in
+  (* Unfold [t] if applicable. *)
+  let t := 
+    match unfold_def Γ t.1 evm with 
+    | Some def => (def, t.2)
+    | None => t
+    end
+  in
+  (* Weak-head reduce [t] using the specialized reduction strategy defined above. *)
+  let t := reduce_theta_tapp evm Γ t in
+  (* Check the head constructor. 
+     NOTE : I include tVar here as it seems to make sense, 
+     whereas the official unicoq implementation does not (probably a mistake ?). *)
+  match t.1 with 
+  | tCase _ _ _ _ | tFix _ _ | tCoFix _ _ | tVar _ | tRel _ | tLambda _ _ _ => true 
+  | _ => false 
+  end.
+
 (** * Main unification loop. *)
 
 (** [unify] unifies two terms : it is the main entry point of the algorithm.
@@ -1003,12 +1119,7 @@ with eta_match dir Γ pb (x_ty_body : aname * term * term) (t' : term) evm {stru
   let* evm := check_product Γ ty' (x, ty) evm in 
   (* Lift [t'] and apply it to [tRel 0]. *)
   let t'' := mkApp (lift0 1 t') (tRel 0) in
-  (* Unify [body =?= t'']. 
-     Note that it is not strictly necessary to preserve the direction of the equation for
-     eta expansion : indeed on terms which are not types [Conv] and [Cumul] coincide, 
-     and a lambda abstraction is never a type.
-     For consistency I choose to anyways preserve the direction (it should also
-     make the code more robust to future changes). *)
+  (* Unify [body =?= t'']. *)
   match dir with 
   | Original => unify (Γ ,, vass x ty) pb body t'' evm
   | Swapped => unify (Γ ,, vass x ty) pb t'' body evm
@@ -1060,8 +1171,9 @@ Definition test :=
 Eval vm_compute in test.
 
 (* TODO : 
+- add try_conv heuristic
 - meta_inst_solution : beta reduce heuristic + remove equal tails
-- fix generation of universe constraints
-- add controlled backtracking
+- fix generation of universe constraints (maybe ask Yannick for help)
+- add controlled backtracking 
 - handle universe polymorphism
 *)

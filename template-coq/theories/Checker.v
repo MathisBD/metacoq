@@ -181,7 +181,7 @@ Section Reduce.
   match t with
 
   | tRel c =>
-    if RedFlags.zeta flags then
+    if RedFlags.delta flags then
       d <- nth_error Γ c ;;
       match d.(decl_body) with
       | None => ret (t, stack)
@@ -230,9 +230,8 @@ Section Reduce.
 
   | tFix mfix idx =>
     if RedFlags.fix_ flags then
-      nf <- unfold_fix mfix idx ;;
-      let '(narg, fn) := nf in
-      match  List.nth_error stack narg with
+      '(narg, fn) <- unfold_fix mfix idx ;;
+      match List.nth_error stack narg with
       | Some c =>
         c' <- reduce_stack Γ n c [] ;;
         match fst c' with
@@ -241,6 +240,12 @@ Section Reduce.
         end
       | _ => ret (t, stack)
       end
+    else ret (t, stack)
+
+  | tCoFix mfix idx =>
+    if RedFlags.cofix_ flags then 
+      '(narg, fn) <- unfold_fix mfix idx ;;
+      reduce_stack Γ n fn stack
     else ret (t, stack)
 
   | tProd _ _ _ => ret (t, stack)
