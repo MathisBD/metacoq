@@ -798,6 +798,15 @@ with try_app_fo Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
     failM $ str "App-FO : not same arg size"
 
 with unify_head Γ pb t t' evm {struct pb} : M EvarMap.t :=
+  (* Helper function to unify universe instances.
+     Instances are always unified using equality (not cumulativity). *)
+  let unify_uinst u u' evm :=
+    ise_list2 
+      (fun l l' evm => 
+        liftM (EvarMap.set_eq_level evm l l') 
+              (str "Unify-UInst : universe inconsistency"))
+      u u' evm 
+  in
   match whd_evars evm t, whd_evars evm t' with 
   (* Type-Same *)
   | tSort s, tSort s' =>
@@ -809,10 +818,7 @@ with unify_head Γ pb t t' evm {struct pb} : M EvarMap.t :=
       end
     in 
     (* Check the universe graph is still consistent. *)
-    match evm with
-    | Some evm => retM evm 
-    | None => failM $ str "Type-Same : universe inconsistency"
-    end
+    liftM evm $ str "Type-Same : universe inconsistency"
   (* Lam-Same *)
   | tLambda x ty body, tLambda _ ty' body' =>
     let* evm := unify Γ Conv ty ty' evm in 
@@ -825,19 +831,31 @@ with unify_head Γ pb t t' evm {struct pb} : M EvarMap.t :=
   | tLetIn x def ty body, tLetIn _ def' ty' body' =>
     let* evm := unify Γ Conv def def' evm in
     unify (Γ ,, vdef x def ty) pb body body' evm
-  (* Rigid-Same *)
+  (* Rel-Same *)
   | tRel n, tRel n' => 
-    if n == n' then retM evm else failM $ str "Rel-Same : not same head"
+    if n == n' then retM evm 
+    else failM $ str "Rel-Same : not same head"
+  (* Var-Same *)
   | tVar v, tVar v' => 
-    if v == v' then retM evm else failM $ str "Var-Same : not same head"
-  | tConst c _, tConst c' _ =>
-    if c == c' then retM evm else failM $ str "Const-Same : not same head"
-  | tInd ind _, tInd ind' _ =>
-    if ind == ind' then retM evm else failM $ str "Ind-Same : not same head"
-  | tConstruct ind n _, tConstruct ind' n' _ =>
-    if (ind == ind') && (n == n') then retM evm else failM $ str "Construct-Same : not same head"  
+    if v == v' then retM evm 
+    else failM $ str "Var-Same : not same head"
+  (* Const-Same *)
+  | tConst c u, tConst c' u' =>
+    if c == c' then unify_uinst u u' evm
+    else failM $ str "Const-Same : not same head"
+  (* Ind-Same *)
+  | tInd ind u, tInd ind' u' =>
+    if ind == ind' then unify_uinst u u' evm
+    else failM $ str "Ind-Same : not same head"
+  (* Construct-Same *)
+  | tConstruct ind n u, tConstruct ind' n' u' =>
+    if (ind == ind') && (n == n') then unify_uinst u u' evm 
+    else failM $ str "Construct-Same : not same head"  
+  (* Proj-Same *)
   | tProj p t, tProj p' t' =>
-    if p == p' then unify Γ Conv t t' evm else failM $ str "Prof-Same : not same head"
+    if p == p' then unify Γ Conv t t' evm 
+    else failM $ str "Prof-Same : not same head"
+  (* (Co)Fix-Same *)
   | tFix defs n, tFix defs' n'
   | tCoFix defs n, tCoFix defs' n' =>
     if n == n' then 
@@ -846,19 +864,25 @@ with unify_head Γ pb t t' evm {struct pb} : M EvarMap.t :=
       (* Then unify the bodies in an extended context. *)
       ise_list2 (unify (Γ ,,, fix_context defs) Conv) (List.map dbody defs) (List.map dbody defs') evm
     else failM $ str "(Co)Fix-Same : not same head"
+  (* Case-Same *)
   | tCase ci pred x bs, tCase ci' pred' x' bs' =>
     if ci == ci' then 
-      let* (pred, bs) := liftM (rebuild_case Σ ci pred bs) (str $ "Failed to rebuild case"%pstring) in
-      let* (pred', bs') := liftM (rebuild_case Σ ci' pred' bs') (str $ "Failed to rebuild case"%pstring) in 
+      (* Instead of unifying the arguments of each branch one by one and then the bodies,
+         we reconstruct the lambda abstractions corresponding the the branches and predicate
+         and unify those directly. *)
+      let* (pred_t, bs_t) := liftM (rebuild_case Σ ci pred bs) (str $ "Failed to rebuild case"%pstring) in
+      let* (pred_t', bs_t') := liftM (rebuild_case Σ ci' pred' bs') (str $ "Failed to rebuild case"%pstring) in 
       (* Unify the return predicates. *)
-      let* evm := unify Γ Conv pred pred' evm in 
+      let* evm := unify Γ Conv pred_t pred_t' evm in 
+      (* Unify the universe instances. *)
+      let* evm := unify_uinst pred.(puinst) pred'.(puinst) evm in
       (* Unify the scrutinees. *)
       let* evm := unify Γ Conv x x' evm in
       (* Unify the branches. *)
-      ise_list2 (unify Γ Conv) bs bs' evm
+      ise_list2 (unify Γ Conv) bs_t bs_t' evm
     else failM $ str "Case-Same : not same head"
-  | _, _ => failM $ str ""
-  end
+  | _, _ => failM $ str "Head-Same : not applicable"
+  end  
   
 (** [try_reduce] tries to reduce/unfold one side of the equation. *)
 with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
@@ -1042,4 +1066,6 @@ Eval vm_compute in test.
 - adapt the Checker to handle evars.
 - meta_inst_solution : beta reduce heuristic + remove equal tails
 - fix generation of universe constraints
+- add controlled backtracking
+- handle universe polymorphism
 *)

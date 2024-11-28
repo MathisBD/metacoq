@@ -18,13 +18,22 @@ Unset Guard Checking.
 Notation "f $ x" := (f x) 
   (at level 10, x at level 100, right associativity, only parsing).
 
+(** [lexpr_leq_constraints l1 l2] computes the universe constraints to encode [l1 <= l2]. *)
+Definition lexpr_leq_constraints (l r : LevelExpr.t) : ConstraintSet.t :=
+  let diff := (Z.of_nat l.2 - Z.of_nat r.2)%Z in 
+  ConstraintSet.singleton (l.1, ConstraintType.Le diff, r.1).
+
+(** [lexpr_eq_constraints l1 l2] computes the universe constraints to encode [l1 = l2]. *)
+Definition lexpr_eq_constraints (l r : LevelExpr.t) : ConstraintSet.t :=
+  let diff := (Z.of_nat l.2 - Z.of_nat r.2)%Z in
+  if diff == 0%Z
+  then ConstraintSet.singleton (l.1, ConstraintType.Eq, r.1) 
+  else ConstraintSet.add (l.1, ConstraintType.Le diff, r.1) $
+       ConstraintSet.singleton (r.1, ConstraintType.Le $ Z.opp diff, l.1).
+
 (** [sort_leq_constraints s1 s2] returns a set of universe constraints that encode 
     the inequality [s1 <= s2], or [None] if [s1 <= s2] is trivially unsatisfiable. *)
 Definition sort_leq_constraints (s1 s2 : Sort.t) : option ConstraintSet.t := 
-  (* Make a constraint between two [LevelExpr.t]. *)
-  let lexpr_edge (l r : LevelExpr.t) : UnivConstraint.t :=
-    let diff := (Z.of_nat l.2 - Z.of_nat r.2)%Z in (l.1, ConstraintType.Le diff, r.1)
-  in
   match s1, s2 with
   (* Trivial constraints. *)
   | sSProp, sSProp
@@ -35,11 +44,11 @@ Definition sort_leq_constraints (s1 s2 : Sort.t) : option ConstraintSet.t :=
   | sType l, sType r =>
     match Universe.exprs l, Universe.exprs r with
     (* No algebraics : add a single constraint. *)
-    | (l, []), (r, []) => Some $ ConstraintSet.singleton $ lexpr_edge l r
+    | (l, []), (r, []) => Some $ lexpr_leq_constraints l r
     (* Algebraic on the left-hand side : add multiple constraints. *)
     | (l, ls), (r, []) =>
       Some $ List.fold_left 
-        (fun acc l' => ConstraintSet.add (lexpr_edge l' r) acc) 
+        (fun acc l' => ConstraintSet.union (lexpr_leq_constraints l' r) acc) 
         (l :: ls) 
         ConstraintSet.empty
     (* Algebraics on the right-hand side are not supported. *) 
@@ -52,14 +61,6 @@ Definition sort_leq_constraints (s1 s2 : Sort.t) : option ConstraintSet.t :=
 (** [eq_constraints s1 s2] returns a set of constraints that encode 
     the equality [s1 = s2], or [None] if [s1 = s2] is trivially unsatisfiable. *)
 Definition sort_eq_constraints (s1 s2 : Sort.t) : option ConstraintSet.t := 
-  (* Make an equality constraint between two [LevelExpr.t]. *)
-  let lexpr_cstr (l r : LevelExpr.t) : ConstraintSet.t :=
-    let diff := (Z.of_nat l.2 - Z.of_nat r.2)%Z in
-    if diff == 0%Z
-    then ConstraintSet.singleton (l.1, ConstraintType.Eq, r.1) 
-    else ConstraintSet.add (l.1, ConstraintType.Le diff, r.1) $
-         ConstraintSet.singleton (r.1, ConstraintType.Le $ Z.opp diff, l.1)
-  in
   match s1, s2 with
   (* Trivial constraints. *)
   | sSProp, sSProp
@@ -68,8 +69,8 @@ Definition sort_eq_constraints (s1 s2 : Sort.t) : option ConstraintSet.t :=
   | sType l, sType r =>
     match Universe.exprs l, Universe.exprs r with
     (* No algebraics. *)
-    | (l, []), (r, []) => Some $ lexpr_cstr l r
-    (* Algebraics are not supported yet. *) 
+    | (l, []), (r, []) => Some $ lexpr_eq_constraints l r
+    (* Algebraics are not supported. *) 
     | _, _ => None
     end
   (* Everything else is unsatisfiable. *)
@@ -262,14 +263,24 @@ Definition add_univ_constraints (evm : EvarMap.t) (cstrs : ConstraintSet.t) : op
          ;  evm_universes := universes |}
   else None.
 
+(** [set_eq_level evm l1 l2] adds the constraint [l1 = l2] to [evm].
+    It returns [None] if the new constraints are inconsistent. *)
+Definition set_eq_level (evm : t) (l1 l2 : Level.t) : option t :=
+  add_univ_constraints evm =<< lexpr_eq_constraints (l1, 0) (l2, 0).
+
+(** [set_leq_level evm l1 l2] adds the constraint [l1 <= l2] to [evm].
+    It returns [None] if the new constraints are inconsistent. *)
+Definition set_leq_level (evm : t) (l1 l2 : Level.t) : option t :=
+  add_univ_constraints evm =<< lexpr_leq_constraints (l1, 0) (l2, 0).
+
 (** [set_eq_sort evm s1 s2] adds constraints to [evm] to enforce [s1 = s1].
-    It returns [None] if the added constraints are inconsistent. *)
-Definition set_eq_sort (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
+    It returns [None] if the new constraints are inconsistent. *)
+Definition set_eq_sort (evm : t) (s1 s2 : Sort.t) : option t :=
   add_univ_constraints evm =<< sort_eq_constraints s1 s2.
 
 (** [set_leq_sort evm s1 s2] adds constraints to [evm] to enforce [s1 <= s1].
-    It returns [None] if the added constraints are inconsistent. *)
-Definition set_leq_sort (evm : EvarMap.t) (s1 s2 : Sort.t) : option EvarMap.t :=
+    It returns [None] if the new constraints are inconsistent. *)
+Definition set_leq_sort (evm : t) (s1 s2 : Sort.t) : option t :=
     add_univ_constraints evm =<< sort_leq_constraints s1 s2.
 
 End EvarMap.
@@ -294,7 +305,8 @@ Fixpoint instantiate_evar (ctx : named_context) (subs : list term) (def : term) 
   | _, _ => def 
   end.
 
-(** [nf_evars evm t] replaces all defined evars that appear in [t] by their body. *)
+(** [nf_evars evm t] replaces all defined evars that appear in [t] by their body.
+    It assumes [t] is well-typed. *)
 Fixpoint nf_evars (evm : EvarMap.t) (t : term) {struct t} : term :=
   match t with 
   | tEvar ev subs =>
@@ -308,7 +320,8 @@ Fixpoint nf_evars (evm : EvarMap.t) (t : term) {struct t} : term :=
 
 (** [whd_evars evm t] expands evars just enough to expose the first 
     constructor which is not [tEvar] in [t]. This should be used liberally : 
-    it is essentially free when [t] is not an evar. *)
+    it is essentially free when [t] is not an evar. 
+    It assumes [t] is well-typed. *)
 Fixpoint whd_evars (evm : EvarMap.t) (t : term) {struct t} : term :=
   match t with 
   | tEvar ev subs =>
