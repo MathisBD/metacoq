@@ -95,7 +95,7 @@ Record t := mk
     inst_evars : option ESet.t }.
 
 (** Reasonable default flags. *)
-Definition default := mk LogVerbose true true false Both Both None.
+Definition default := mk LogDefault true true false Both Both None.
 
 (** Modify the [reduce_side] in some flags. *)
 Definition set_reduce_side (s : Side.t) (flags : t) : t :=
@@ -674,9 +674,69 @@ Definition unfold_def Γ t evm : option term :=
   | _ => None 
   end.
 
+(** [check_product Γ t (x, ty) evm] unifies [t <=? forall x : ty, ?body]
+    where [?body : Type] is a fresh evar. *)
+Definition check_product (unify : unif_fun term) Γ (t : term) (x_ty : aname * term) evm : M EvarMap.t :=
+  let (x, ty) := x_ty in
+  (* Create a fresh universe level for the type of the body. *)
+  let (evm, lvl) := EvarMap.fresh_level evm in
+  (* Extend the ambient named context Δ with a declaration for the argument [x : ty] of the product. *)
+  let id' := 
+    fresh_ident 
+      (match x.(binder_name) with nNamed n => n | nAnon => "x" end) 
+      (IdentSetProp.of_list $ List.map fst Δ) 
+  in 
+  let x' := {| binder_name := nNamed id' ; binder_relevance := x.(binder_relevance) |} in
+  let ev_nctx := (id', vass x' ty) :: Δ in
+  (* Create the body of the product. *)
+  let (evm, ev) := EvarMap.fresh_evar evm "body" ev_nctx (tSort $ sType $ Universe.make' lvl) in
+  let body := tEvar ev (tRel 0 :: List.map (tVar <<< fst) Δ) in
+  (* Unify [t <=? forall x : ty, ?body]. *)
+  unify Γ Cumul t (tProd x ty body) evm.
+  
+(** [eta_match dir Γ pb x ty body t' evm] implements the eta-expansion rule
+    to unify [(fun x : ty => body) =?= t']. *)
+Definition eta_match (unify : unif_fun term) dir Γ pb (x_ty_body : aname * term * term) (t' : term) evm : M EvarMap.t :=
+  let '(x, ty, body) := x_ty_body in
+  (* Check [t'] is a product with domain [ty]. *)
+  let* ty' := type_of evm Δ Γ t' in
+  let* evm := check_product unify Γ ty' (x, ty) evm in 
+  (* Lift [t'] and apply it to [tRel 0]. *)
+  let t'' := mkApp (lift0 1 t') (tRel 0) in
+  (* Unify [body =?= t'']. *)
+  match dir with 
+  | Original => unify (Γ ,, vass x ty) pb body t'' evm
+  | Swapped => unify (Γ ,, vass x ty) pb t'' body evm
+  end.
+
+(** * Convertibility heuristic. *)
+
+Section TryConv.
+
+(** Helper function to determine if a term is evar-free. *)
+Fixpoint is_evarfree (t : term) : bool :=
+  match t with 
+  | tEvar _ _ => false 
+  | _ => fold_term (fun b t => b && is_evarfree t) true t
+  end.
+
+(** [try_conv Γ pb t t'] implements the Reduce-Same rule, which tries to unify evar-free terms
+    [t] and [t'] by checking conversion (currently is uses on the algorithm defined in Checker.v). *)
+Definition try_conv Γ pb (t t' : tapp) evm : M (EvarMap.t) :=
+  let t := mkApps t.1 t.2 in
+  let t' := mkApps t'.1 t'.2 in
+  if is_evarfree t && is_evarfree t' then 
+    match Checker.check_conv_gen pb Σ (EvarMap.evm_universes evm) Δ Γ t t' with 
+    | Checked tt => let* _ := log_str "Reduce-Same" in retM evm
+    | TypeError _ => failM $ str "Reduce-Same : not convertible"
+    end
+  else failM $ str "Reduce-Same : terms contain evars".
+
+End TryConv.
+
 (** * First-order approximation. *)
 
-Section AppFO.
+Section TryAppFO.
 Context (unify : unif_fun term).
 
 (** Structurally unify the heads of two terms. *)
@@ -781,11 +841,11 @@ Definition try_app_fo Γ pb (t t' : tapp) evm : M EvarMap.t :=
   else 
     failM $ str "App-FO : not same arg size".
 
-End AppFO.
+End TryAppFO.
 
 (** * Evar instantiation. *)
 
-Section Meta.
+Section TryInstantiate.
 Context (unify : unif_fun term) (unify_tapp : unif_fun tapp).
 
 (** [meta_same ev subs1 subs2 evm] implements the Meta-Same rule to unify [ev[subs1] =?= ev[subs2]]. *)
@@ -921,11 +981,11 @@ Definition try_instantiate Γ pb (t t' : tapp) evm : M EvarMap.t :=
   | _, _ => failM $ str "try_instantiate : expected an evar"
   end.
 
-End Meta.
+End TryInstantiate.
 
 (** * Reduction heuristics. *)
 
-Section Reduction.
+Section TryReduce.
 Context (unify : unif_fun term) (unify_tapp : unif_fun tapp).
 
 (** [reduce_theta_tapp evm Γ t] weak-head reduces [t] using all reduction rules except unfolding 
@@ -1043,41 +1103,6 @@ Definition is_stuck (evm : EvarMap.t) (Γ : context) (t : tapp) : bool :=
   | tCase _ _ _ _ | tFix _ _ | tCoFix _ _ | tVar _ | tRel _ | tLambda _ _ _ => true 
   | _ => false 
   end.
-
-(** [check_product Γ t (x, ty) evm] unifies [t <=? forall x : ty, ?body]
-    where [?body : Type] is a fresh evar. *)
-Definition check_product Γ (t : term) (x_ty : aname * term) evm : M EvarMap.t :=
-  let (x, ty) := x_ty in
-  (* Create a fresh universe level for the type of the body. *)
-  let (evm, lvl) := EvarMap.fresh_level evm in
-  (* Extend the ambient named context Δ with a declaration for the argument [x : ty] of the product. *)
-  let id' := 
-    fresh_ident 
-      (match x.(binder_name) with nNamed n => n | nAnon => "x" end) 
-      (IdentSetProp.of_list $ List.map fst Δ) 
-  in 
-  let x' := {| binder_name := nNamed id' ; binder_relevance := x.(binder_relevance) |} in
-  let ev_nctx := (id', vass x' ty) :: Δ in
-  (* Create the body of the product. *)
-  let (evm, ev) := EvarMap.fresh_evar evm "body" ev_nctx (tSort $ sType $ Universe.make' lvl) in
-  let body := tEvar ev (tRel 0 :: List.map (tVar <<< fst) Δ) in
-  (* Unify [t <=? forall x : ty, ?body]. *)
-  unify Γ Cumul t (tProd x ty body) evm.
-  
-(** [eta_match dir Γ pb x ty body t' evm] implements the eta-expansion rule
-    to unify [(fun x : ty => body) =?= t']. *)
-Definition eta_match dir Γ pb (x_ty_body : aname * term * term) (t' : term) evm : M EvarMap.t :=
-  let '(x, ty, body) := x_ty_body in
-  (* Check [t'] is a product with domain [ty]. *)
-  let* ty' := type_of evm Δ Γ t' in
-  let* evm := check_product Γ ty' (x, ty) evm in 
-  (* Lift [t'] and apply it to [tRel 0]. *)
-  let t'' := mkApp (lift0 1 t') (tRel 0) in
-  (* Unify [body =?= t'']. *)
-  match dir with 
-  | Original => unify (Γ ,, vass x ty) pb body t'' evm
-  | Swapped => unify (Γ ,, vass x ty) pb t'' body evm
-  end.
   
 (** [try_reduce] tries to solve an equation by reducing or unfolding some terms.
     It uses quite sophisticated heuristics to decide when to reduce : read
@@ -1131,7 +1156,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
       (* Reduce and check we made progress. *)
       let t_new := reduce_theta_tapp evm Γ t in
       if eq_term_evars evm (mkApps t.1 t.2) (mkApps t_new.1 t_new.2) then 
-        failM $ str "Red-Iota-L : not applicable"
+        failM $ str "Red-Iota-L : no progress"
       else
         let* _ := log_str "Red-Iota-L" in 
         unify_tapp Γ pb t_new t' evm
@@ -1145,7 +1170,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
       (* Reduce and check we made progress. *)
       let t_new' := reduce_theta_tapp evm Γ t' in
       if eq_term_evars evm (mkApps t'.1 t'.2) (mkApps t_new'.1 t_new'.2) then 
-        failM $ str "Red-Iota-R : not applicable"
+        failM $ str "Red-Iota-R : no progress"
       else 
         let* _ := log_str "Red-Iota-R" in 
         unify_tapp Γ pb t t_new' evm
@@ -1178,7 +1203,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     | _, _, (tLambda _ _ _, _) => failM $ str "Lam-Eta-L : not applicable" 
     | true, (tLambda x ty body, []), _ =>
       let* _ := log_str "Lam-Eta-L" in
-      eta_match Original Γ pb (x, ty, body) (mkApps t'.1 t'.2) evm
+      eta_match unify Original Γ pb (x, ty, body) (mkApps t'.1 t'.2) evm
     | _, _, _ => failM $ str "Lam-Eta-L : not applicable"
     end
   in
@@ -1188,7 +1213,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     | _, (tLambda _ _ _, _), _ => failM $ str "Lam-Eta-R : not applicable" 
     | true, _, (tLambda x' ty' body', []) =>
       let* _ := log_str "Lam-Eta-R" in
-      eta_match Swapped Γ pb (x', ty', body') (mkApps t.1 t.2) evm
+      eta_match unify Swapped Γ pb (x', ty', body') (mkApps t.1 t.2) evm
     | _, _, _ => failM $ str "Lam-Eta-R : not applicable"
     end
   in
@@ -1203,7 +1228,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
   (* Reducing was not successful. *) 
   failM $ str "try_reduce : not applicable".
 
-End Reduction.
+End TryReduce.
 
 (** * Main unification loop. *)
 
@@ -1221,6 +1246,7 @@ with unify_tapp Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
   if is_evar evm t.1 || is_evar evm t'.1 then 
     try_instantiate unify unify_tapp Γ pb t t' evm
   else 
+    try_conv Γ pb t t' evm <|>
     try_app_fo unify Γ pb t t' evm <|>
     try_reduce unify unify_tapp Γ pb t t' evm.
   
@@ -1270,7 +1296,6 @@ Definition test :=
 Eval vm_compute in test.
 
 (* TODO : 
-- add try_conv heuristic
 - meta_inst_solution : beta reduce heuristic + remove equal tails
 - fix generation of universe constraints (maybe ask Yannick for help)
 - add controlled backtracking ("stuck" heuristic)
