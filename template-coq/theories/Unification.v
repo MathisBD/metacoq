@@ -62,10 +62,24 @@ End Side.
     - [Swapped] is the direction [t2] -> [t1]. *)
 Inductive direction := Original | Swapped.
 
+(** The algorithm logs some information : a [log_level] controls how much
+    information is logged. *)
+Inductive log_level := 
+  (** Don't log any information. *)
+  | LogSilent
+  (** Log information only for successful rules. *)
+  | LogDefault
+  (** Log information for all rules, including unsuccessful ones.
+      This easily can generate huge logs. *)
+  | LogVerbose.
+
 (** Unification flags control the behaviour of the unification algorithm. *)
 Module UnifFlags.
 Record t := mk
-  { beta_reduce_type : bool
+  { (** How much information should we log ? *)
+    log_lvl : log_level 
+  ; (** TODO : document this. *)
+    beta_reduce_type : bool
   ; (** When unifying an evar with a term, should we unify the type of the evar
         with the type of the term ? *)
     unify_types : bool 
@@ -81,11 +95,12 @@ Record t := mk
     inst_evars : option ESet.t }.
 
 (** Reasonable default flags. *)
-Definition default := mk true true false Both Both None.
+Definition default := mk LogVerbose true true false Both Both None.
 
 (** Modify the [reduce_side] in some flags. *)
 Definition set_reduce_side (s : Side.t) (flags : t) : t :=
-  {| beta_reduce_type := flags.(beta_reduce_type) 
+  {| log_lvl          := flags.(log_lvl) 
+  ;  beta_reduce_type := flags.(beta_reduce_type) 
   ;  unify_types      := flags.(unify_types) 
   ;  aggressive       := flags.(aggressive)
   ;  reduce_side      := s 
@@ -94,7 +109,8 @@ Definition set_reduce_side (s : Side.t) (flags : t) : t :=
   
 (** Modify the [inst_side] in some flags. *)
 Definition set_inst_side (s : Side.t) (flags : t) : t :=
-  {| beta_reduce_type := flags.(beta_reduce_type) 
+  {| log_lvl          := flags.(log_lvl)
+  ;  beta_reduce_type := flags.(beta_reduce_type) 
   ;  unify_types      := flags.(unify_types) 
   ;  aggressive       := flags.(aggressive)
   ;  reduce_side      := flags.(reduce_side) 
@@ -205,7 +221,12 @@ Definition M A := UnifFlags.t -> Log.t * unif_result A.
 Definition retM {A} (a : A) : M A := fun _ => (Log.empty, Success a).
 
 (** [failM err] writes [err] to the log and returns [UnifError] *)
-Definition failM {A} (err : doc unit) : M A := fun _ => (Log.Log [inr err], UnifError).
+Definition failM {A} (err : doc unit) : M A := 
+  fun flags => 
+    match UnifFlags.log_lvl flags with
+    | LogSilent => (Log.empty, UnifError)
+    | _ => (Log.Log [inr err], UnifError)
+    end.
 
 (** Monadic bind. *)
 Definition bindM {A} {B} (ma : M A) (mf : A -> M B) : M B :=
@@ -222,13 +243,18 @@ Notation "'let*' x := c1 'in' c2" := (bindM c1 (fun x => c2))
 Instance monad_M : Monad M :=
 { ret _ := retM ; bind _ _ := bindM }.
 
-(** Monadic alternative. 
-    We explicitly want to keep the log of failed attempts. *)
+(** Monadic alternative. The [log_lvl] flag controls if we keep the logs of 
+    failed attempts. *)
 Definition orM {A} (mx my : M A) : M A :=
   fun flags =>
     match mx flags with 
     | (l, Success x) => (l, Success x)
-    | (l, UnifError) => let (l', y) := my flags in (Log.append l l', y)
+    | (l, UnifError) => 
+      let (l', y) := my flags in 
+      match UnifFlags.log_lvl flags with 
+      | LogVerbose => (Log.append l l', y)
+      | _ => (l', y)
+      end
     end.
 Notation "x <|> y" := (orM x y) (at level 85, right associativity).
    
@@ -238,19 +264,31 @@ Definition whenM (cond : bool) (x : M unit) : M unit :=
 
 (** Log a (primitive) string. *)
 Definition log_str (s : string) : M unit :=
-  fun _ => (Log.Log [inr $ str s], Success tt).
+  fun flags =>
+    match UnifFlags.log_lvl flags with 
+    | LogSilent => (Log.empty, Success tt)
+    | _ => (Log.Log [inr $ str s], Success tt)
+    end.
 
 (** Log a document. *)
 Definition log_doc (d : doc unit) : M unit :=
-  fun _ => (Log.Log [inr d], Success tt).
-
+  fun flags => 
+    match UnifFlags.log_lvl flags with 
+    | LogSilent => (Log.empty, Success tt)
+    | _ => (Log.Log [inr d], Success tt)
+    end.
+  
 (** Log a unification (sub)problem. It collects the logs of [problem],
     packages them in a [Log.node], and returns the same [unif_result] as [problem].  *)
 Definition log_problem Γ pb t t' evm (problem : M EvarMap.t) : M EvarMap.t :=
   fun flags =>
     let (elements, res) := problem flags in 
-    let node := Log.mknode _ evm Γ pb t t' elements res in
-    (Log.Log [inl node], res).  
+    match UnifFlags.log_lvl flags with 
+    | LogSilent => (Log.empty, res)
+    | _ =>
+      let node := Log.mknode _ evm Γ pb t t' elements res in
+      (Log.Log [inl node], res)
+    end.  
 
 (** [liftM x err] lifts a value from the [option] monad to [M].
     In case of failure it writes [err] to the log. *)
@@ -479,11 +517,33 @@ Definition invert (evm : EvarMap.t) (map : EMap.t (list nat)) (nctx : named_cont
 
 End Invert.
 
+(** * Unification algorithm. *)
+
 Section Algorithm.
 Context `{PrettyFlags.t} `{checker_flags} (Σ : global_env) (Δ : named_context).
-
-Implicit Types (Γ : context) (up : UnifFlags.t) (pb : conv_pb).
 Existing Instance Checker.default_fuel.
+
+(** * Term applications. *)
+
+(** Similar to a stack reduction machine, the unification algorithm keeps
+    the arguments of applications separate from the head :[(f, args)] represents 
+    the application [mkApps f args]. Note that we do not always maintain the invariant 
+    that [args] is non-empty or that [f] is not an application : we use [whd_tapp]
+    whenever we require these conditions locally. *)
+Definition tapp := term * list term.
+
+(** [whd_tapp evm t] expands evars and removes casts in the head of [t]. *)
+Fixpoint whd_tapp (evm : EvarMap.t) (t : tapp) {struct t} : tapp :=
+  let (f, args) := t in
+  match whd_evars evm f with 
+  | tApp f' args' => whd_tapp evm (f', args' ++ args)
+  | tCast f' _ _ => whd_tapp evm (f', args)
+  | f' => (f', args)
+  end.
+
+(** [unif_fun t] is the type of functions which can unify things of type [t]
+    (typically [term] or [tapp]). *)
+Definition unif_fun t := context -> conv_pb -> t -> t -> EvarMap.t -> M EvarMap.t.
 
 (** [type_of evm Δ Γ t] computes the type of term [t] in named context [Δ] and local context [Γ].
     It assumes that [t] is well-typed. *)
@@ -596,9 +656,140 @@ Definition intersect (flags : UnifFlags.t) evm (xs ys : list term) : option (lis
     end 
   in 
   loop 0 xs ys [].
-          
-(** [meta_same evm ev subs1 subs2] implements the Meta-Same rule to unify [ev[subs1] =?= ev[subs2]]. *)
-Definition meta_same evm (ev : evar) (subs1 subs2 : list term) : M EvarMap.t :=
+
+(** [unfold_def Γ t evm] unfolds the definition of a local variable (tRel or tVar) or constant. *)
+Definition unfold_def Γ t evm : option term :=
+  match whd_evars evm t with 
+  | tRel n => 
+    match decl_body =<< List.nth_error Γ n with 
+    | Some body => Some $ lift0 (S n) body
+    | None => None 
+    end 
+  | tVar id => decl_body =<< lookup_nctx Δ id
+  | tConst c uinst =>
+    match cst_body =<< lookup_constant Σ c with 
+    | Some body => Some $ subst_instance uinst body
+    | None => None 
+    end
+  | _ => None 
+  end.
+
+(** * First-order approximation. *)
+
+Section AppFO.
+Context (unify : unif_fun term).
+
+(** Structurally unify the heads of two terms. *)
+Definition unify_head Γ pb (t t' : term) evm : M EvarMap.t :=
+  (* Helper function to unify universe instances.
+     Instances are always unified using equality (not cumulativity). *)
+  let unify_uinst u u' evm :=
+    ise_list2 
+      (fun l l' evm => 
+        liftM (EvarMap.set_eq_level evm l l') 
+              (str "Unify-UInst : universe inconsistency"))
+      u u' evm 
+  in
+  match whd_evars evm t, whd_evars evm t' with 
+  (* Type-Same *)
+  | tSort s, tSort s' =>
+    (* Enforce the new universe constraints. *)
+    let evm :=
+      match pb with 
+      | Conv => EvarMap.set_eq_sort evm s s' 
+      | Cumul => EvarMap.set_eq_sort evm s s'
+      end
+    in 
+    (* Check the universe graph is still consistent. *)
+    liftM evm $ str "Type-Same : universe inconsistency"
+  (* Lam-Same *)
+  | tLambda x ty body, tLambda _ ty' body' =>
+    let* evm := unify Γ Conv ty ty' evm in 
+    unify (Γ ,, vass x ty) pb body body' evm
+  (* Prod-Same *)
+  | tProd x a b, tProd _ a' b' =>
+    let* evm := unify Γ Conv a a' evm in 
+    unify (Γ ,, vass x a) pb b b' evm
+  (* Let-Same *)
+  | tLetIn x def ty body, tLetIn _ def' ty' body' =>
+    let* evm := unify Γ Conv def def' evm in
+    unify (Γ ,, vdef x def ty) pb body body' evm
+  (* Rel-Same *)
+  | tRel n, tRel n' => 
+    if n == n' then retM evm 
+    else failM $ str "Rel-Same : not same head"
+  (* Var-Same *)
+  | tVar v, tVar v' => 
+    if v == v' then retM evm 
+    else failM $ str "Var-Same : not same head"
+  (* Const-Same *)
+  | tConst c u, tConst c' u' =>
+    if c == c' then unify_uinst u u' evm
+    else failM $ str "Const-Same : not same head"
+  (* Ind-Same *)
+  | tInd ind u, tInd ind' u' =>
+    if ind == ind' then unify_uinst u u' evm
+    else failM $ str "Ind-Same : not same head"
+  (* Construct-Same *)
+  | tConstruct ind n u, tConstruct ind' n' u' =>
+    if (ind == ind') && (n == n') then unify_uinst u u' evm 
+    else failM $ str "Construct-Same : not same head"  
+  (* Proj-Same *)
+  | tProj p t, tProj p' t' =>
+    if p == p' then unify Γ Conv t t' evm 
+    else failM $ str "Prof-Same : not same head"
+  (* (Co)Fix-Same *)
+  | tFix defs n, tFix defs' n'
+  | tCoFix defs n, tCoFix defs' n' =>
+    if n == n' then 
+      (* First unify the types. *)
+      let* evm := ise_list2 (unify Γ Conv) (List.map dtype defs) (List.map dtype defs') evm in
+      (* Then unify the bodies in an extended context. *)
+      ise_list2 (unify (Γ ,,, fix_context defs) Conv) (List.map dbody defs) (List.map dbody defs') evm
+    else failM $ str "(Co)Fix-Same : not same head"
+  (* Case-Same *)
+  | tCase ci pred x bs, tCase ci' pred' x' bs' =>
+    if ci == ci' then 
+      (* Instead of unifying the arguments of each branch one by one and then the bodies,
+         we reconstruct the lambda abstractions corresponding the the branches and predicate
+         and unify those directly. *)
+      let* (pred_t, bs_t) := liftM (rebuild_case Σ ci pred bs) (str $ "Failed to rebuild case"%pstring) in
+      let* (pred_t', bs_t') := liftM (rebuild_case Σ ci' pred' bs') (str $ "Failed to rebuild case"%pstring) in 
+      (* Unify the return predicates. *)
+      let* evm := unify Γ Conv pred_t pred_t' evm in 
+      (* Unify the universe instances. *)
+      let* evm := unify_uinst pred.(puinst) pred'.(puinst) evm in
+      (* Unify the scrutinees. *)
+      let* evm := unify Γ Conv x x' evm in
+      (* Unify the branches. *)
+      ise_list2 (unify Γ Conv) bs_t bs_t' evm
+    else failM $ str "Case-Same : not same head"
+  | _, _ => failM $ str "Head-Same : not applicable"
+  end.
+
+(** [try_app_fo] applies the first-order heuristic to structurally unify 
+    the two sides of an equation. *)
+Definition try_app_fo Γ pb (t t' : tapp) evm : M EvarMap.t :=
+  let (f, args) := whd_tapp evm t in 
+  let (f', args') := whd_tapp evm t' in
+  if #|args| == #|args'| then 
+    let* _ := log_str "App-FO" in
+    (* Unify the heads. *)
+    let* evm := unify_head Γ pb f f' evm in 
+    (* Unify the arguments. *)
+    ise_list2 (unify Γ Conv) args args' evm
+  else 
+    failM $ str "App-FO : not same arg size".
+
+End AppFO.
+
+(** * Evar instantiation. *)
+
+Section Meta.
+Context (unify : unif_fun term) (unify_tapp : unif_fun tapp).
+
+(** [meta_same ev subs1 subs2 evm] implements the Meta-Same rule to unify [ev[subs1] =?= ev[subs2]]. *)
+Definition meta_same (ev : evar) (subs1 subs2 : list term) evm : M EvarMap.t :=
   let* _ := log_str "Meta-Same" in
   (* Check if the evar can be instantiated. *)
   let* flags := get_unif_flags in
@@ -628,35 +819,114 @@ Definition meta_inst_solution Γ (ev : evar) (subs args : list term) (t : term) 
   (* TODO : refresh universes. *)
   retM (evm, t1).
 
-(** [unfold_def Γ t evm] unfolds the definition of a local variable (tRel or tVar) or constant. *)
-Definition unfold_def Γ t evm : option term :=
-  match whd_evars evm t with 
-  | tRel n => 
-    match decl_body =<< List.nth_error Γ n with 
-    | Some body => Some $ lift0 (S n) body
-    | None => None 
-    end 
-  | tVar id => decl_body =<< lookup_nctx Δ id
-  | tConst c uinst =>
-    match cst_body =<< lookup_constant Σ c with 
-    | Some body => Some $ subst_instance uinst body
-    | None => None 
+(** [meta_inst dir Γ ev subs args t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t].
+    [dir] is [Original] if [ev] is on the left-hand side, and [Swapped] if [ev] is on the right-hand side. *)
+Definition meta_inst dir Γ ev subs args (t : tapp) evm : M EvarMap.t :=
+  let is_var t := 
+    match whd_evars evm t with tVar _ | tRel _ => true | _ => false end 
+  in
+  (* Check the evar is instantiable and that the substitution and arguments contain 
+     only variables (tVars and tRels). *)
+  let side := match dir with Original => Left | Swapped => Right end in
+  let* flags := get_unif_flags in
+  if allowed_inst flags ev side && List.forallb is_var (subs ++ args) then 
+    let* _ := log_doc $ str "Meta-Inst-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
+    (* Allow reduction and instantiation on both sides in subproblems. *)
+    let flags := 
+      UnifFlags.set_reduce_side Both $
+      UnifFlags.set_inst_side Both flags
+    in
+    with_unif_flags flags $  
+    (* Compute the solution [sol]. *)
+    let* (evm, sol) := meta_inst_solution Γ ev subs args (mkApps t.1 t.2) evm in
+    let* _ := log_doc $ str "solution :" ^+^ 
+      print_term (Σ, Monomorphic_ctx) [] sol 
+    in
+    (* Unify the type of the evar with the type of the solution (if the relevant flag is set). *)
+    let* evm :=
+      if UnifFlags.unify_types flags
+      then 
+        let* entry := liftM (EvarMap.lookup evm ev) (str "Undefined evar #" ^^ nat10 ev) in
+        let* sol_ty := type_of evm entry.(ev_nctx) [] sol in
+        let ev_ty := instantiate_evar entry.(ev_nctx) subs entry.(ev_concl) in
+        unify Γ Cumul sol_ty ev_ty evm
+      else retM evm
+    in 
+    (* Check the evar does not occur in the solution. *)
+    if evar_occurs evm ev sol then failM $ str "Meta-Inst : occur check failed" else
+    (* Finally define the evar. *)
+    retM $ EvarMap.define evm ev sol
+  else failM $ str "Meta-Inst : not applicable".
+
+(** [meta_fo dir Γ pb ev subs args t evm] implements a first-order heuristic to 
+    unify [ev[subs] args] and [t]. This heuristic is similar to the rule App-FO
+    but slightly more general : it applies even if [t] has more arguments than [ev]. 
+    For instance it will split the problem [ev[subs] x1 x2 =?= f y1 y2 y3 y4] into
+    the subproblems [ev[subs] =?= f y1 y2], [x1 =?= y3] and [x2 =?= y4].  *)
+Definition meta_fo dir Γ pb ev subs args (t : tapp) evm : M EvarMap.t :=
+  (* Check if we are allowed to use this heuristic. *)
+  let* flags := get_unif_flags in
+  let ev_side := match dir with Original => Left | Swapped => Right end in
+  if allowed_inst flags ev ev_side && 
+     (* If the evar has no arguments, Meta-Inst will trigger. *)
+     (0 <? #|args|) && 
+     (* We allow [t] and [ev] to have the same number of arguments to be more general than App-FO. *)
+     (#|args| <=? #|t.2|) 
+  then
+    let* _ := log_doc $ str "Meta-FO-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
+    (* Unify the heads and the arguments. As usual we check the arguments for 
+       convertibility [Conv] even when checking the applications for cumulativity [Cumul]. *)
+    let (t_args1, t_args2) := chop (#|t.2| - #|args|) t.2 in 
+    match dir with 
+    | Original =>
+      let* evm := unify_tapp Γ pb (tEvar ev subs, []) (t.1, t_args1) evm in
+      ise_list2 (unify Γ Conv) args t_args2 evm
+    | Swapped =>
+      let* evm := unify_tapp Γ pb (t.1, t_args1) (tEvar ev subs, []) evm in
+      ise_list2 (unify Γ Conv) t_args2 args evm
     end
-  | _ => None 
+  else failM $ str "Meta-FO : not applicable".
+
+(** [try_instantiate Γ pb t t' evm] is called when either [t] or [t'] is an evar (possible applied
+    to a suspended subsitution and arguments), and tries to apply rules which instantiate evars. *)
+Definition try_instantiate Γ pb (t t' : tapp) evm : M EvarMap.t :=
+  let t := whd_tapp evm t in 
+  let t' := whd_tapp evm t' in
+  match t.1, t'.1 with 
+  | tEvar ev subs, tEvar ev' subs' => 
+    if ev == ev' then
+    (* Meta-Same *)
+      let* evm := meta_same ev subs subs' evm in 
+      ise_list2 (unify Γ Conv) t.2 t'.2 evm
+    (* Meta-Meta *)
+    else
+      (* We try both directions, but first the one with the longest substitution. *)
+      let '(dir1, dir2, ev1, ev2, subs1, subs2, args1, args2, t1, t2) := 
+        if #|subs| <? #|subs'|
+        then (Swapped, Original, ev', ev, subs', subs, t'.2, t.2, t, t')
+        else (Original, Swapped, ev, ev', subs, subs', t.2, t'.2, t', t)
+      in 
+      meta_inst dir1 Γ    ev1 subs1 args1 t1 evm <|> 
+      meta_inst dir2 Γ    ev2 subs2 args2 t2 evm <|>
+      meta_fo   dir1 Γ pb ev1 subs1 args1 t1 evm <|>
+      meta_fo   dir2 Γ pb ev2 subs2 args2 t2 evm
+  (* Meta-InstL *)
+  | tEvar ev subs, _ => 
+    meta_inst Original Γ    ev subs t.2 t' evm <|>
+    meta_fo   Original Γ pb ev subs t.2 t' evm
+  (* Meta-InstR *)
+  | _, tEvar ev' subs' => 
+    meta_inst Swapped Γ    ev' subs' t'.2 t evm <|>
+    meta_fo   Swapped Γ pb ev' subs' t'.2 t evm
+  | _, _ => failM $ str "try_instantiate : expected an evar"
   end.
 
-(** [tapp f args] represents the application of a term [f] to arguments [args].
-    The list of arguments can be empty. *)
-Definition tapp := term * list term.
+End Meta.
 
-(** [whd_tapp evm t] expands evars and removes casts in the head of [t]. *)
-Fixpoint whd_tapp (evm : EvarMap.t) (t : tapp) {struct t} : tapp :=
-  let (f, args) := t in
-  match whd_evars evm f with 
-  | tApp f' args' => whd_tapp evm (f', args' ++ args)
-  | tCast f' _ _ => whd_tapp evm (f', args)
-  | f' => (f', args)
-  end.
+(** * Reduction heuristics. *)
+
+Section Reduction.
+Context (unify : unif_fun term) (unify_tapp : unif_fun tapp).
 
 (** [reduce_theta_tapp evm Γ t] weak-head reduces [t] using all reduction rules except unfolding 
     (i.e. beta, zeta, iota, evar-expansion, cast-erasure).
@@ -774,231 +1044,45 @@ Definition is_stuck (evm : EvarMap.t) (Γ : context) (t : tapp) : bool :=
   | _ => false 
   end.
 
-(** * Main unification loop. *)
-
-(** [unify] unifies two terms : it is the main entry point of the algorithm.
-    It is a simple wrapper around [unify_tapp]. *)
-Fixpoint unify Γ pb (t t' : term) evm {struct pb} : M EvarMap.t :=
-  unify_tapp Γ pb (t, []) (t', []) evm
-
-(** [unify_tapp] unifies two [tapp]s [t] and [t']. Note that [t] and [t'] are not 
-    required to be in whd_tapp form. *)
-with unify_tapp Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
-  log_problem Γ pb (tApp t.1 t.2) (tApp t'.1 t'.2) evm $
-  let t := whd_tapp evm t in 
-  let t' := whd_tapp evm t' in 
-  if is_evar evm t.1 || is_evar evm t'.1 then 
-    try_instantiate Γ pb t t' evm
-  else 
-    try_app_fo Γ pb t t' evm <|>
-    try_reduce Γ pb t t' evm
-
-(** [try_instantiate] is called when either [t] or [t'] is an evar (possible applied
-    to a suspended subsitution and arguments), and tries to apply rules which instantiate evars. *)
-with try_instantiate Γ pb t t' evm {struct pb} : M EvarMap.t :=
-  let t := whd_tapp evm t in 
-  let t' := whd_tapp evm t' in
-  match t.1, t'.1 with 
-  | tEvar ev subs, tEvar ev' subs' => 
-    if ev == ev' 
-    (* Meta-Same *)
-    then 
-      let* evm := meta_same evm ev subs subs' in 
-      ise_list2 (unify Γ Conv) t.2 t'.2 evm
-    (* Meta-Meta *)
-    else
-      (* We try both directions, but first the one with the longest substitution. *)
-      let '(dir1, dir2, ev1, ev2, subs1, subs2, args1, args2, t1, t2) := 
-        if #|subs| <? #|subs'|
-        then (Swapped, Original, ev', ev, subs', subs, t'.2, t.2, t, t')
-        else (Original, Swapped, ev, ev', subs, subs', t.2, t'.2, t', t)
-      in 
-      meta_inst dir1 Γ pb ev1 subs1 args1 t1 evm <|> 
-      meta_inst dir2 Γ pb ev2 subs2 args2 t2 evm <|>
-      meta_fo   dir1 Γ pb ev1 subs1 args1 t1 evm <|>
-      meta_fo   dir2 Γ pb ev2 subs2 args2 t2 evm
-  (* Meta-InstL *)
-  | tEvar ev subs, _ => 
-    meta_inst Original Γ pb ev subs t.2 t' evm <|>
-    meta_fo   Original Γ pb ev subs t.2 t' evm
-  (* Meta-InstR *)
-  | _, tEvar ev' subs' => 
-    meta_inst Swapped Γ pb ev' subs' t'.2 t evm <|>
-    meta_fo   Swapped Γ pb ev' subs' t'.2 t evm
-  | _, _ => failM $ str "try_instantiate : expected an evar"
-  end
-
-(** [meta_fo dir Γ pb ev subs args t evm] implements a first-order heuristic to 
-    unify [ev[subs] args] and [t]. This heuristic is similar to the rule App-FO
-    but slightly more general : it applies even if [t] has more arguments than [ev]. 
-    For instance it will split the problem [ev[subs] x1 x2 =?= f y1 y2 y3 y4] into
-    the subproblems [ev[subs] =?= f y1 y2], [x1 =?= y3] and [x2 =?= y4].  *)
-with meta_fo dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
-  (* Check if we are allowed to use this heuristic. *)
-  let* flags := get_unif_flags in
-  let ev_side := match dir with Original => Left | Swapped => Right end in
-  if allowed_inst flags ev ev_side && 
-     (* If the evar has no arguments, Meta-Inst will trigger. *)
-     (0 <? #|args|) && 
-     (* We allow [t] and [ev] to have the same number of arguments to be more general than App-FO. *)
-     (#|args| <=? #|t.2|) 
-  then
-    let* _ := log_doc $ str "Meta-FO-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
-    (* Unify the heads and the arguments. As usual we check the arguments for 
-       convertibility [Conv] even when checking the applications for cumulativity [Cumul]. *)
-    let (t_args1, t_args2) := chop (#|t.2| - #|args|) t.2 in 
-    match dir with 
-    | Original =>
-      let* evm := unify_tapp Γ pb (tEvar ev subs, []) (t.1, t_args1) evm in
-      ise_list2 (unify Γ Conv) args t_args2 evm
-    | Swapped =>
-      let* evm := unify_tapp Γ pb (t.1, t_args1) (tEvar ev subs, []) evm in
-      ise_list2 (unify Γ Conv) t_args2 args evm
-    end
-  else failM $ str "Meta-FO : not applicable"
-
-(** [meta_inst dir Γ pb ev subs args t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t].
-    [dir] is [Original] if [ev] is on the left-hand side, and [Swapped] if [ev] is on the right-hand side. *)
-(* TODO : better unif_errors. *)
-with meta_inst dir Γ pb ev subs args (t : tapp) evm {struct pb} : M EvarMap.t :=
-  let is_var t := 
-    match whd_evars evm t with tVar _ | tRel _ => true | _ => false end 
-  in
-  (* Check the evar is instantiable and that the substitution and arguments contain 
-     only variables (tVars and tRels). *)
-  let side := match dir with Original => Left | Swapped => Right end in
-  let* flags := get_unif_flags in
-  if allowed_inst flags ev side && List.forallb is_var (subs ++ args) then 
-    let* _ := log_doc $ str "Meta-Inst-" ^^ match dir with Original => str "L" | Swapped => str "R" end in
-    (* Allow reduction and instantiation on both sides in subproblems. *)
-    let flags := 
-      UnifFlags.set_reduce_side Both $
-      UnifFlags.set_inst_side Both flags
-    in
-    with_unif_flags flags $  
-    (* Compute the solution [sol]. *)
-    let* (evm, sol) := meta_inst_solution Γ ev subs args (mkApps t.1 t.2) evm in
-    let* _ := log_doc $ str "solution :" ^+^ 
-      print_term (Σ, Monomorphic_ctx) [] sol 
-    in
-    (* Unify the type of the evar with the type of the solution (if the relevant flag is set). *)
-    let* evm :=
-      if UnifFlags.unify_types flags
-      then 
-        let* entry := liftM (EvarMap.lookup evm ev) (str "Undefined evar #" ^^ nat10 ev) in
-        let* sol_ty := type_of evm entry.(ev_nctx) [] sol in
-        let ev_ty := instantiate_evar entry.(ev_nctx) subs entry.(ev_concl) in
-        unify Γ Cumul sol_ty ev_ty evm
-      else retM evm
-    in 
-    (* Check the evar does not occur in the solution. *)
-    if evar_occurs evm ev sol then failM $ str "Meta-Inst : occur check failed" else
-    (* Finally define the evar. *)
-    retM $ EvarMap.define evm ev sol
-  else failM $ str "Meta-Inst : not applicable"
-
-(** [try_app_fo] tries to structurally unify the two sides of the equation. *)
-with try_app_fo Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
-  let (f, args) := whd_tapp evm t in 
-  let (f', args') := whd_tapp evm t' in
-  if #|args| == #|args'| then 
-    let* _ := log_str "App-FO" in
-    (* Unify the heads. *)
-    let* evm := unify_head Γ pb f f' evm in 
-    (* Unify the arguments. *)
-    ise_list2 (unify Γ Conv) args args' evm
-  else 
-    failM $ str "App-FO : not same arg size"
-
-with unify_head Γ pb t t' evm {struct pb} : M EvarMap.t :=
-  (* Helper function to unify universe instances.
-     Instances are always unified using equality (not cumulativity). *)
-  let unify_uinst u u' evm :=
-    ise_list2 
-      (fun l l' evm => 
-        liftM (EvarMap.set_eq_level evm l l') 
-              (str "Unify-UInst : universe inconsistency"))
-      u u' evm 
-  in
-  match whd_evars evm t, whd_evars evm t' with 
-  (* Type-Same *)
-  | tSort s, tSort s' =>
-    (* Enforce the new universe constraints. *)
-    let evm :=
-      match pb with 
-      | Conv => EvarMap.set_eq_sort evm s s' 
-      | Cumul => EvarMap.set_eq_sort evm s s'
-      end
-    in 
-    (* Check the universe graph is still consistent. *)
-    liftM evm $ str "Type-Same : universe inconsistency"
-  (* Lam-Same *)
-  | tLambda x ty body, tLambda _ ty' body' =>
-    let* evm := unify Γ Conv ty ty' evm in 
-    unify (Γ ,, vass x ty) pb body body' evm
-  (* Prod-Same *)
-  | tProd x a b, tProd _ a' b' =>
-    let* evm := unify Γ Conv a a' evm in 
-    unify (Γ ,, vass x a) pb b b' evm
-  (* Let-Same *)
-  | tLetIn x def ty body, tLetIn _ def' ty' body' =>
-    let* evm := unify Γ Conv def def' evm in
-    unify (Γ ,, vdef x def ty) pb body body' evm
-  (* Rel-Same *)
-  | tRel n, tRel n' => 
-    if n == n' then retM evm 
-    else failM $ str "Rel-Same : not same head"
-  (* Var-Same *)
-  | tVar v, tVar v' => 
-    if v == v' then retM evm 
-    else failM $ str "Var-Same : not same head"
-  (* Const-Same *)
-  | tConst c u, tConst c' u' =>
-    if c == c' then unify_uinst u u' evm
-    else failM $ str "Const-Same : not same head"
-  (* Ind-Same *)
-  | tInd ind u, tInd ind' u' =>
-    if ind == ind' then unify_uinst u u' evm
-    else failM $ str "Ind-Same : not same head"
-  (* Construct-Same *)
-  | tConstruct ind n u, tConstruct ind' n' u' =>
-    if (ind == ind') && (n == n') then unify_uinst u u' evm 
-    else failM $ str "Construct-Same : not same head"  
-  (* Proj-Same *)
-  | tProj p t, tProj p' t' =>
-    if p == p' then unify Γ Conv t t' evm 
-    else failM $ str "Prof-Same : not same head"
-  (* (Co)Fix-Same *)
-  | tFix defs n, tFix defs' n'
-  | tCoFix defs n, tCoFix defs' n' =>
-    if n == n' then 
-      (* First unify the types. *)
-      let* evm := ise_list2 (unify Γ Conv) (List.map dtype defs) (List.map dtype defs') evm in
-      (* Then unify the bodies in an extended context. *)
-      ise_list2 (unify (Γ ,,, fix_context defs) Conv) (List.map dbody defs) (List.map dbody defs') evm
-    else failM $ str "(Co)Fix-Same : not same head"
-  (* Case-Same *)
-  | tCase ci pred x bs, tCase ci' pred' x' bs' =>
-    if ci == ci' then 
-      (* Instead of unifying the arguments of each branch one by one and then the bodies,
-         we reconstruct the lambda abstractions corresponding the the branches and predicate
-         and unify those directly. *)
-      let* (pred_t, bs_t) := liftM (rebuild_case Σ ci pred bs) (str $ "Failed to rebuild case"%pstring) in
-      let* (pred_t', bs_t') := liftM (rebuild_case Σ ci' pred' bs') (str $ "Failed to rebuild case"%pstring) in 
-      (* Unify the return predicates. *)
-      let* evm := unify Γ Conv pred_t pred_t' evm in 
-      (* Unify the universe instances. *)
-      let* evm := unify_uinst pred.(puinst) pred'.(puinst) evm in
-      (* Unify the scrutinees. *)
-      let* evm := unify Γ Conv x x' evm in
-      (* Unify the branches. *)
-      ise_list2 (unify Γ Conv) bs_t bs_t' evm
-    else failM $ str "Case-Same : not same head"
-  | _, _ => failM $ str "Head-Same : not applicable"
-  end  
+(** [check_product Γ t (x, ty) evm] unifies [t <=? forall x : ty, ?body]
+    where [?body : Type] is a fresh evar. *)
+Definition check_product Γ (t : term) (x_ty : aname * term) evm : M EvarMap.t :=
+  let (x, ty) := x_ty in
+  (* Create a fresh universe level for the type of the body. *)
+  let (evm, lvl) := EvarMap.fresh_level evm in
+  (* Extend the ambient named context Δ with a declaration for the argument [x : ty] of the product. *)
+  let id' := 
+    fresh_ident 
+      (match x.(binder_name) with nNamed n => n | nAnon => "x" end) 
+      (IdentSetProp.of_list $ List.map fst Δ) 
+  in 
+  let x' := {| binder_name := nNamed id' ; binder_relevance := x.(binder_relevance) |} in
+  let ev_nctx := (id', vass x' ty) :: Δ in
+  (* Create the body of the product. *)
+  let (evm, ev) := EvarMap.fresh_evar evm "body" ev_nctx (tSort $ sType $ Universe.make' lvl) in
+  let body := tEvar ev (tRel 0 :: List.map (tVar <<< fst) Δ) in
+  (* Unify [t <=? forall x : ty, ?body]. *)
+  unify Γ Cumul t (tProd x ty body) evm.
   
-(** [try_reduce] tries to reduce/unfold one side of the equation. *)
-with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
+(** [eta_match dir Γ pb x ty body t' evm] implements the eta-expansion rule
+    to unify [(fun x : ty => body) =?= t']. *)
+Definition eta_match dir Γ pb (x_ty_body : aname * term * term) (t' : term) evm : M EvarMap.t :=
+  let '(x, ty, body) := x_ty_body in
+  (* Check [t'] is a product with domain [ty]. *)
+  let* ty' := type_of evm Δ Γ t' in
+  let* evm := check_product Γ ty' (x, ty) evm in 
+  (* Lift [t'] and apply it to [tRel 0]. *)
+  let t'' := mkApp (lift0 1 t') (tRel 0) in
+  (* Unify [body =?= t'']. *)
+  match dir with 
+  | Original => unify (Γ ,, vass x ty) pb body t'' evm
+  | Swapped => unify (Γ ,, vass x ty) pb t'' body evm
+  end.
+  
+(** [try_reduce] tries to solve an equation by reducing or unfolding some terms.
+    It uses quite sophisticated heuristics to decide when to reduce : read
+    the Unicoq paper for more details. *)
+Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
   let* flags := get_unif_flags in
   let t := whd_tapp evm t in 
   let t' := whd_tapp evm t' in
@@ -1077,6 +1161,7 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
       unify_tapp Γ pb t_new t' evm
     | _, _ => failM $ str "Cons-Delta-L : not applicable"
     end
+  in
   (* Cons-Delta-R *)
   let cons_deltaR :=
     match can_reduce Right, unfold_def Γ t'.1 evm with 
@@ -1111,52 +1196,38 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
   lam_betaL    <|> lam_betaR    <|>
   let_zetaL    <|> let_zetaR    <|>
   red_iotaL    <|> red_iotaR    <|>
-  (* Then try delta reduction. *)
-  cons_deltaL  <|> cons_deltaR  <|>
-  (* Finally try eta expansion. *)
+  (* Then try eta expansion. *)
   lam_etaL     <|> lam_etaR     <|>
+  (* Finally try delta reduction. *)
+  cons_deltaL  <|> cons_deltaR  <|>
   (* Reducing was not successful. *) 
-  failM $ str "try_reduce : not applicable"
+  failM $ str "try_reduce : not applicable".
 
-(** [check_product Γ t (x, ty) evm] unifies [t <=? forall x : ty, ?body]
-    where [?body : Type] is a fresh evar. *)
-with check_product Γ (t : term) (x_ty : aname * term) evm {struct t} : M EvarMap.t :=
-  let (x, ty) := x_ty in
-  (* Create a fresh universe level for the type of the body. *)
-  let (evm, lvl) := EvarMap.fresh_level evm in
-  (* Extend the ambient named context Δ with a declaration for the argument [x : ty] of the product. *)
-  let id' := 
-    fresh_ident 
-      (match x.(binder_name) with nNamed n => n | nAnon => "x" end) 
-      (IdentSetProp.of_list $ List.map fst Δ) 
-  in 
-  let x' := {| binder_name := nNamed id' ; binder_relevance := x.(binder_relevance) |} in
-  let ev_nctx := (id', vass x' ty) :: Δ in
-  (* Create the body of the product. *)
-  let (evm, ev) := EvarMap.fresh_evar evm "body" ev_nctx (tSort $ sType $ Universe.make' lvl) in
-  let body := tEvar ev (tRel 0 :: List.map (tVar <<< fst) Δ) in
-  (* Unify [t <=? forall x : ty, ?body]. *)
-  unify Γ Cumul t (tProd x ty body) evm
+End Reduction.
 
-(** [eta_match dir Γ pb x ty body t' evm] implements the eta-expansion rule
-    to unify [(fun x : ty => body) =?= t']. *)
-with eta_match dir Γ pb (x_ty_body : aname * term * term) (t' : term) evm {struct pb} : M EvarMap.t :=
-  let '(x, ty, body) := x_ty_body in
-  (* Check [t'] is a product with domain [ty]. *)
-  let* ty' := type_of evm Δ Γ t' in
-  let* evm := check_product Γ ty' (x, ty) evm in 
-  (* Lift [t'] and apply it to [tRel 0]. *)
-  let t'' := mkApp (lift0 1 t') (tRel 0) in
-  (* Unify [body =?= t'']. *)
-  match dir with 
-  | Original => unify (Γ ,, vass x ty) pb body t'' evm
-  | Swapped => unify (Γ ,, vass x ty) pb t'' body evm
-  end.
+(** * Main unification loop. *)
 
+(** [unify] unifies two terms : it is the main entry point of the algorithm.
+    It is a simple wrapper around [unify_tapp]. *)
+Fixpoint unify Γ pb (t t' : term) evm {struct pb} : M EvarMap.t :=
+  unify_tapp Γ pb (t, []) (t', []) evm
+
+(** [unify_tapp] unifies two [tapp]s [t] and [t']. Note that [t] and [t'] are not 
+    required to be in whd_tapp-normal form. *)
+with unify_tapp Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
+  log_problem Γ pb (tApp t.1 t.2) (tApp t'.1 t'.2) evm $
+  let t := whd_tapp evm t in 
+  let t' := whd_tapp evm t' in 
+  if is_evar evm t.1 || is_evar evm t'.1 then 
+    try_instantiate unify unify_tapp Γ pb t t' evm
+  else 
+    try_app_fo unify Γ pb t t' evm <|>
+    try_reduce unify unify_tapp Γ pb t t' evm.
+  
 End Algorithm.
 
-(****************************)
-(** Testing *)
+(*************************************************************************************)
+(** * Testing *)
 
 From MetaCoq.Template Require Import All.
 
@@ -1202,6 +1273,6 @@ Eval vm_compute in test.
 - add try_conv heuristic
 - meta_inst_solution : beta reduce heuristic + remove equal tails
 - fix generation of universe constraints (maybe ask Yannick for help)
-- add controlled backtracking 
+- add controlled backtracking ("stuck" heuristic)
 - handle universe polymorphism
 *)
