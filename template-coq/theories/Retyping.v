@@ -46,6 +46,7 @@ Section StructuralEquality.
     | _, _ => false
     end.
   
+  (** Comparison of terms modulo alpha equivalence, universe cumulativity and evar expansion. *)
   Fixpoint leq_term_evars (t u : term) {struct t} :=
     match whd_evars evm t, whd_evars evm u with
     | tRel n, tRel n' => Nat.eqb n n'

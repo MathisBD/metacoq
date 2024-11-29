@@ -650,7 +650,7 @@ Definition unfold_def Γ t evm : option term :=
 Definition tapp := term * list term.
 
 (** [whd_tapp evm t] expands evars and removes casts in the head of [t]. *)
-Fixpoint whd_tapp evm (t : tapp) {struct t} : tapp :=
+Fixpoint whd_tapp (evm : EvarMap.t) (t : tapp) {struct t} : tapp :=
   let (f, args) := t in
   match whd_evars evm f with 
   | tApp f' args' => whd_tapp evm (f', args' ++ args)
@@ -1002,87 +1002,115 @@ with try_reduce Γ pb (t t' : tapp) evm {struct pb} : M EvarMap.t :=
   let* flags := get_unif_flags in
   let t := whd_tapp evm t in 
   let t' := whd_tapp evm t' in
-  (* Helper function to check if we are _not_ allowed to reduce on the given side. *)
-  let cannot_reduce side := negb $ Side.leq side (UnifFlags.reduce_side flags) in
+  (* Helper function to check if we are allowed to reduce on the given side. *)
+  let can_reduce side := Side.leq side (UnifFlags.reduce_side flags) in
   (* Lam-Beta-L *)
   let lam_betaL :=
-    if cannot_reduce Left then failM $ str "Lam-Beta-L : not applicable" else
-    match t with 
-    | (tLambda _ _ body, arg :: args) => 
+    match can_reduce Left, t with 
+    | true, (tLambda _ _ body, arg :: args) => 
       let* _ := log_str "Lam-Beta-L" in
       unify_tapp Γ pb (subst0 [arg] body, args) t' evm
-    | _ => failM $ str "Lam-Beta-L : not applicable"
+    | _, _ => failM $ str "Lam-Beta-L : not applicable"
     end
   in
   (* Lam-Beta-R *)
   let lam_betaR :=
-    if cannot_reduce Right then failM $ str "Lam-Beta-R : not applicable" else
-    match t' with 
-    | (tLambda _ _ body', arg' :: args') => 
+    match can_reduce Right, t' with 
+    | true, (tLambda _ _ body', arg' :: args') => 
       let* _ := log_str "Lam-Beta-R" in
       unify_tapp Γ pb t (subst0 [arg'] body', args') evm
-    | _ => failM $ str "Lam-Beta-R : not applicable"
+    | _, _ => failM $ str "Lam-Beta-R : not applicable"
     end
   in 
   (* Let-Zeta-L *)
   let let_zetaL :=
-    if cannot_reduce Left then failM $ str "Let-Zeta-L : not applicable" else 
-    match t with 
-    | (tLetIn _ def _ body, args) =>
+    match can_reduce Left, t with 
+    | true, (tLetIn _ def _ body, args) =>
       let* _ := log_str "Let-Zeta-L" in
       unify_tapp Γ pb (subst0 [def] body, args) t' evm
-    | _ => failM $ str "Let-Zeta-L : not applicable"
+    | _, _ => failM $ str "Let-Zeta-L : not applicable"
     end
   in
   (* Let-Zeta-R *)
   let let_zetaR :=
-    if cannot_reduce Right then failM $ str "Let-Zeta-R : not applicable" else 
-    match t' with 
-    | (tLetIn _ def' _ body', args') =>
+    match can_reduce Right, t' with 
+    | true, (tLetIn _ def' _ body', args') =>
       let* _ := log_str "Let-Zeta-R" in
       unify_tapp Γ pb t (subst0 [def'] body', args') evm
-    | _ => failM $ str "Let-Zeta-R : not applicable"
+    | _, _ => failM $ str "Let-Zeta-R : not applicable"
+    end
+  in
+  (* Red-Iota-L *)
+  let red_iotaL :=
+    match can_reduce Left, t.1 with 
+    | true, tCase _ _ _ _ | true, tFix _ _ | true, tCoFix _ _ =>
+      (* Reduce and check we made progress. *)
+      let t_new := reduce_theta_tapp evm Γ t in
+      if eq_term_evars evm (mkApps t.1 t.2) (mkApps t_new.1 t_new.2) then 
+        failM $ str "Red-Iota-L : not applicable"
+      else
+        let* _ := log_str "Red-Iota-L" in 
+        unify_tapp Γ pb t_new t' evm
+    | _, _ => failM $ str "Red-Iota-L : not applicable"
+    end
+  in
+  (* Red-Iota-R *)
+  let red_iotaR :=
+    match can_reduce Right, t'.1 with 
+    | true, tCase _ _ _ _ | true, tFix _ _ | true, tCoFix _ _ =>
+      (* Reduce and check we made progress. *)
+      let t_new' := reduce_theta_tapp evm Γ t' in
+      if eq_term_evars evm (mkApps t'.1 t'.2) (mkApps t_new'.1 t_new'.2) then 
+        failM $ str "Red-Iota-R : not applicable"
+      else 
+        let* _ := log_str "Red-Iota-R" in 
+        unify_tapp Γ pb t t_new' evm
+    | _, _ => failM $ str "Red-Iota-R : not applicable"
     end
   in
   (* Cons-Delta-L *)
   let cons_deltaL :=
-    if cannot_reduce Left then failM $ str "Cons-Delta-L : not applicable" else 
-    let* def := liftM (unfold_def Γ t.1 evm) (str "Cons-Delta-L : not applicable") in 
-    let* _ := log_str "Cons-Delta-L" in 
-    unify_tapp Γ pb (def, t.2) t' evm
-  in
+    match can_reduce Left, unfold_def Γ t.1 evm with 
+    | true, Some def =>
+      let* _ := log_str "Cons-Delta-L" in 
+      let t_new := reduce_theta_tapp evm Γ (def, t.2) in
+      unify_tapp Γ pb t_new t' evm
+    | _, _ => failM $ str "Cons-Delta-L : not applicable"
+    end
   (* Cons-Delta-R *)
   let cons_deltaR :=
-    if cannot_reduce Right then failM $ str "Cons-Delta-R : not applicable" else 
-    let* def' := liftM (unfold_def Γ t'.1 evm) (str "Cons-Delta-R : not applicable") in 
-    let* _ := log_str "Cons-Delta-R" in 
-    unify_tapp Γ pb t (def', t'.2) evm
+    match can_reduce Right, unfold_def Γ t'.1 evm with 
+    | true, Some def' =>
+      let* _ := log_str "Cons-Delta-R" in 
+      let t_new' := reduce_theta_tapp evm Γ (def', t'.2) in
+      unify_tapp Γ pb t t_new' evm
+    | _, _ => failM $ str "Cons-Delta-R : not applicable"
+    end
   in
   (* Lam-Eta-L *)
   let lam_etaL :=
-    if cannot_reduce Left then failM $ str "Lam-Eta-L : not applicable" else  
-    match t, t' with
-    | _, (tLambda _ _ _, _) => failM $ str "Lam-Eta-L : not applicable" 
-    | (tLambda x ty body, []), _ =>
+    match can_reduce Left, t, t' with
+    | _, _, (tLambda _ _ _, _) => failM $ str "Lam-Eta-L : not applicable" 
+    | true, (tLambda x ty body, []), _ =>
       let* _ := log_str "Lam-Eta-L" in
       eta_match Original Γ pb (x, ty, body) (mkApps t'.1 t'.2) evm
-    | _, _ => failM $ str "Lam-Eta-L : not applicable"
+    | _, _, _ => failM $ str "Lam-Eta-L : not applicable"
     end
   in
   (* Lam-EtaR *)
   let lam_etaR :=
-    if cannot_reduce Right then failM $ str "Lam-Eta-R : not applicable" else  
-    match t, t' with
-    | (tLambda _ _ _, _), _ => failM $ str "Lam-Eta-R : not applicable" 
-    | _, (tLambda x' ty' body', []) =>
+    match can_reduce Right, t, t' with
+    | _, (tLambda _ _ _, _), _ => failM $ str "Lam-Eta-R : not applicable" 
+    | true, _, (tLambda x' ty' body', []) =>
       let* _ := log_str "Lam-Eta-R" in
       eta_match Swapped Γ pb (x', ty', body') (mkApps t.1 t.2) evm
-    | _, _ => failM $ str "Lam-Eta-R : not applicable"
+    | _, _, _ => failM $ str "Lam-Eta-R : not applicable"
     end
   in
   (* First try beta/zeta/iota reduction. *)
   lam_betaL    <|> lam_betaR    <|>
   let_zetaL    <|> let_zetaR    <|>
+  red_iotaL    <|> red_iotaR    <|>
   (* Then try delta reduction. *)
   cons_deltaL  <|> cons_deltaR  <|>
   (* Finally try eta expansion. *)
