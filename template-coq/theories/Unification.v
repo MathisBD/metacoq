@@ -78,14 +78,15 @@ Module UnifFlags.
 Record t := mk
   { (** How much information should we log ? *)
     log_lvl : log_level 
-  ; (** TODO : document this. *)
-    beta_reduce_type : bool
-  ; (** When unifying an evar with a term, should we unify the type of the evar
-        with the type of the term ? *)
-    unify_types : bool 
+  ; (** When instantiating an evar with a term [t], should we weak-head beta reduce [t] ?
+        This helps to remove false dependencies, e.g. when [t] is [(fun _ => 0) x]. *)
+    inst_beta_reduce : bool
+  ; (** When unifying an evar with a term [t], should we unify the type of the evar
+        with the type of [t] ? *)
+    inst_unify_types : bool 
   ; (** When unifying [?x[subs1] =?= ?x[subs2]] (rule Meta-Same), should we allow
         [subs1] and [subs2] to disagree on positions which are not variables (tVar or tRel) ? *)
-    aggressive : bool
+    meta_same_aggressive : bool
   ; (** On which side(s) is it allowed to reduce ? *)
     reduce_side : Side.t
   ; (** On which side(s) is it allowed to instantiate evars ? *)
@@ -99,23 +100,23 @@ Definition default := mk LogDefault true true false Both Both None.
 
 (** Modify the [reduce_side] in some flags. *)
 Definition set_reduce_side (s : Side.t) (flags : t) : t :=
-  {| log_lvl          := flags.(log_lvl) 
-  ;  beta_reduce_type := flags.(beta_reduce_type) 
-  ;  unify_types      := flags.(unify_types) 
-  ;  aggressive       := flags.(aggressive)
-  ;  reduce_side      := s 
-  ;  inst_side        := flags.(inst_side)
-  ;  inst_evars       := flags.(inst_evars) |}.
+  {| log_lvl              := flags.(log_lvl) 
+  ;  inst_beta_reduce     := flags.(inst_beta_reduce) 
+  ;  inst_unify_types     := flags.(inst_unify_types) 
+  ;  meta_same_aggressive := flags.(meta_same_aggressive)
+  ;  reduce_side          := s 
+  ;  inst_side            := flags.(inst_side)
+  ;  inst_evars           := flags.(inst_evars) |}.
   
 (** Modify the [inst_side] in some flags. *)
 Definition set_inst_side (s : Side.t) (flags : t) : t :=
-  {| log_lvl          := flags.(log_lvl)
-  ;  beta_reduce_type := flags.(beta_reduce_type) 
-  ;  unify_types      := flags.(unify_types) 
-  ;  aggressive       := flags.(aggressive)
-  ;  reduce_side      := flags.(reduce_side) 
-  ;  inst_side        := s
-  ;  inst_evars       := flags.(inst_evars) |}.  
+  {| log_lvl              := flags.(log_lvl)
+  ;  inst_beta_reduce     := flags.(inst_beta_reduce) 
+  ;  inst_unify_types     := flags.(inst_unify_types) 
+  ;  meta_same_aggressive := flags.(meta_same_aggressive)
+  ;  reduce_side          := flags.(reduce_side) 
+  ;  inst_side            := s
+  ;  inst_evars           := flags.(inst_evars) |}.  
 
 End UnifFlags.
 
@@ -307,7 +308,13 @@ Definition get_unif_flags : M UnifFlags.t :=
 Definition with_unif_flags {A} (flags : UnifFlags.t) (x : M A) : M A :=
   fun _ => x flags.
 
-(** * Unification algorithm. *)
+(** [has_free_rel evm n t] checks if [tRel n] occurs in [t], expanding evars on the way. *)
+Fixpoint has_free_rel (evm : EvarMap.t) (n : nat) (t : term) : bool :=
+  match whd_evars evm t with 
+  | tRel n' => n == n' 
+  | t => fold_term_with_binders n (fun _ => S) 
+           (fun n b t => b || has_free_rel evm n t) false t
+  end.
 
 (** [allowed_inst flags ev side] checks if we are allowed to instantiate evar [ev]. 
     [side] is the side(s) on which the evar occurs. *)
@@ -541,6 +548,17 @@ Fixpoint whd_tapp (evm : EvarMap.t) (t : tapp) {struct t} : tapp :=
   | f' => (f', args)
   end.
 
+(** [whd_beta_tapp evm (t, args)] weak-head beta reduces the term [mkApps f args]. *)
+Definition whd_beta_tapp (evm : EvarMap.t) (t : tapp) : tapp :=
+  let fix loop t {struct t} :=
+    match whd_tapp evm t with 
+    | (tApp f args1, args2) => loop (f, args1 ++ args2)
+    | (tLambda _ _ body, arg :: args) => loop (subst0 [arg] body, args) 
+    | t => t
+    end
+  in
+  loop t.
+
 (** [unif_fun t] is the type of functions which can unify things of type [t]
     (typically [term] or [tapp]). *)
 Definition unif_fun t := context -> conv_pb -> t -> t -> EvarMap.t -> M EvarMap.t.
@@ -650,7 +668,7 @@ Definition intersect (flags : UnifFlags.t) evm (xs ys : list term) : option (lis
     | x :: xs, y :: ys =>
       if eq_term_evars evm x y then loop (S i) xs ys diff 
       else if is_var x && is_var y then loop (S i) xs ys (i :: diff)
-      else if UnifFlags.aggressive flags then loop (S i) xs ys (i :: diff)
+      else if UnifFlags.meta_same_aggressive flags then loop (S i) xs ys (i :: diff)
       else None
     | _, _ => None 
     end 
@@ -864,20 +882,47 @@ Definition meta_same (ev : evar) (subs1 subs2 : list term) evm : M EvarMap.t :=
     end
   else failM $ str "Meta-Same : not applicable".
 
+(** [remove_equal_tails (f, args) (f', args')] removes the equal variables 
+    (tRel or tVar) of args and args', starting from the right most argument, 
+    and until a different variable is found. It needs to check that no
+    solution is lost, meaning that the variable being removed is not
+    duplicated in any of the spines or bodies. *)
+Definition remove_equal_tails (evm : EvarMap.t) (t t' : tapp) : list term * list term :=
+  (* We process arguments from last to first. *)  
+  let fix loop xs ys :=
+    match xs, ys with 
+    | tRel n :: xs, tRel n' :: ys => 
+      if (n == n') && List.forallb (negb <<< has_free_rel evm n) (t.1 :: t'.1 :: xs ++ ys)  
+      then loop xs ys else (rev xs, rev ys)
+    | tVar id :: xs, tVar id' :: ys =>
+      if (id == id') && List.forallb (negb <<< has_free_var evm [id]) (t.1 :: t'.1 :: xs ++ ys)
+      then loop xs ys else (rev xs, rev ys)
+    | _, _ => (rev xs, rev ys)
+    end 
+  in 
+  loop (rev t.2) (rev t'.2).  
+
 (** Helper function used to implement [meta_inst]. 
     It inverts the equation [ev[subs] args =?= t] and returns :
     - the updated evar map (after pruning).
     - the term [t'] that [ev] will get instantiated with, which lives in the local context of [ev]. *)
-Definition meta_inst_solution Γ (ev : evar) (subs args : list term) (t : term) evm  : M (EvarMap.t * term) :=
-  (* TODO : remove equal tails. *)
-  (* TODO : beta-reduce to remove dependencies. *)
+Definition meta_inst_solution Γ (ev : evar) (subs args : list term) (t : tapp) evm : M (EvarMap.t * term) :=
+  (* Remove equal tails in the two lists of arguments.
+     This helps avoid unnecessarily eta-expanded solutions. *)
+  let (args, t_args) := remove_equal_tails evm (tEvar ev subs, args) t in
+  let t := (t.1, t_args) in
+  (* If the relevant flag is set, weak-head beta reduce [t] to remove dependencies. *)
+  let* flags := get_unif_flags in
+  let t := if UnifFlags.inst_beta_reduce flags then whd_beta_tapp evm t else t in
+  (* Invert [t]. *)
   let* entry := liftM (EvarMap.lookup evm ev) (str "Undefined evar #" ^^ nat10 ev) in
-  let* (map, t0) := invert evm (EMap.empty (list nat)) entry.(ev_nctx) ev subs args t in
-  let* (map, t1) := invert_lambdas evm Γ map entry.(ev_nctx) ev subs args t0 in
+  let t := mkApps t.1 t.2 in
+  let* (map, t) := invert evm (EMap.empty (list nat)) entry.(ev_nctx) ev subs args t in
+  let* (map, t) := invert_lambdas evm Γ map entry.(ev_nctx) ev subs args t in
   (* Prune the evar map as required by [map]. *)
   let* evm := prune_all evm map tt in
   (* TODO : refresh universes. *)
-  retM (evm, t1).
+  retM (evm, t).
 
 (** [meta_inst dir Γ ev subs args t evm] implements the Meta-Inst rule to instantiate [ev[subs] args := t].
     [dir] is [Original] if [ev] is on the left-hand side, and [Swapped] if [ev] is on the right-hand side. *)
@@ -898,13 +943,13 @@ Definition meta_inst dir Γ ev subs args (t : tapp) evm : M EvarMap.t :=
     in
     with_unif_flags flags $  
     (* Compute the solution [sol]. *)
-    let* (evm, sol) := meta_inst_solution Γ ev subs args (mkApps t.1 t.2) evm in
+    let* (evm, sol) := meta_inst_solution Γ ev subs args t evm in
     let* _ := log_doc $ str "solution :" ^+^ 
       print_term (Σ, Monomorphic_ctx) [] sol 
     in
     (* Unify the type of the evar with the type of the solution (if the relevant flag is set). *)
     let* evm :=
-      if UnifFlags.unify_types flags
+      if UnifFlags.inst_unify_types flags
       then 
         let* entry := liftM (EvarMap.lookup evm ev) (str "Undefined evar #" ^^ nat10 ev) in
         let* sol_ty := type_of evm entry.(ev_nctx) [] sol in
@@ -988,7 +1033,7 @@ End TryInstantiate.
 Section TryReduce.
 Context (unify : unif_fun term) (unify_tapp : unif_fun tapp).
 
-(** [reduce_theta_tapp evm Γ t] weak-head reduces [t] using all reduction rules except unfolding 
+(** [whd_theta_tapp evm Γ t] weak-head reduces [t] using all reduction rules except unfolding 
     (i.e. beta, zeta, iota, evar-expansion, cast-erasure).
     Additionnally, it tries to reduce match scrutinees and fixpoint recursive arguments 
     using _all_ rules (including unfolding), if it allows a iota reduction to trigger
@@ -996,7 +1041,7 @@ Context (unify : unif_fun term) (unify_tapp : unif_fun tapp).
     
     It uses a call-by-name reduction strategy (i.e. it does not reduce arguments before 
     substituting them). *)
-Definition reduce_theta_tapp (evm : EvarMap.t) (Γ : context) (t : tapp) : tapp :=
+Definition whd_theta_tapp (evm : EvarMap.t) (Γ : context) (t : tapp) : tapp :=
   (* This is a standard stack-based reduction machine. The flag [inside_arg] controls whether 
      we are inside a match scrutinee or fixpoint argument. *)
   let fix loop (inside_arg : bool) (t : tapp) {struct t} : tapp := 
@@ -1095,7 +1140,7 @@ Definition is_stuck (evm : EvarMap.t) (Γ : context) (t : tapp) : bool :=
     end
   in
   (* Weak-head reduce [t] using the specialized reduction strategy defined above. *)
-  let t := reduce_theta_tapp evm Γ t in
+  let t := whd_theta_tapp evm Γ t in
   (* Check the head constructor. 
      NOTE : I include tVar here as it seems to make sense, 
      whereas the official unicoq implementation does not (probably a mistake ?). *)
@@ -1154,7 +1199,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Left, t.1 with 
     | true, tCase _ _ _ _ | true, tFix _ _ | true, tCoFix _ _ =>
       (* Reduce and check we made progress. *)
-      let t_new := reduce_theta_tapp evm Γ t in
+      let t_new := whd_theta_tapp evm Γ t in
       if eq_term_evars evm (mkApps t.1 t.2) (mkApps t_new.1 t_new.2) then 
         failM $ str "Red-Iota-L : no progress"
       else
@@ -1168,7 +1213,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Right, t'.1 with 
     | true, tCase _ _ _ _ | true, tFix _ _ | true, tCoFix _ _ =>
       (* Reduce and check we made progress. *)
-      let t_new' := reduce_theta_tapp evm Γ t' in
+      let t_new' := whd_theta_tapp evm Γ t' in
       if eq_term_evars evm (mkApps t'.1 t'.2) (mkApps t_new'.1 t_new'.2) then 
         failM $ str "Red-Iota-R : no progress"
       else 
@@ -1182,7 +1227,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Left, unfold_def Γ t.1 evm with 
     | true, Some def =>
       let* _ := log_str "Cons-Delta-L" in 
-      let t_new := reduce_theta_tapp evm Γ (def, t.2) in
+      let t_new := whd_theta_tapp evm Γ (def, t.2) in
       unify_tapp Γ pb t_new t' evm
     | _, _ => failM $ str "Cons-Delta-L : not applicable"
     end
@@ -1192,7 +1237,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Right, unfold_def Γ t'.1 evm with 
     | true, Some def' =>
       let* _ := log_str "Cons-Delta-R" in 
-      let t_new' := reduce_theta_tapp evm Γ (def', t'.2) in
+      let t_new' := whd_theta_tapp evm Γ (def', t'.2) in
       unify_tapp Γ pb t t_new' evm
     | _, _ => failM $ str "Cons-Delta-R : not applicable"
     end
@@ -1296,7 +1341,6 @@ Definition test :=
 Eval vm_compute in test.
 
 (* TODO : 
-- meta_inst_solution : beta reduce heuristic + remove equal tails
 - fix generation of universe constraints (maybe ask Yannick for help)
 - add controlled backtracking ("stuck" heuristic)
 - handle universe polymorphism
