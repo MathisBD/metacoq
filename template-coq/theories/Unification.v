@@ -1343,5 +1343,5 @@ Eval vm_compute in test.
 (* TODO : 
 - fix generation of universe constraints (maybe ask Yannick for help)
 - add controlled backtracking ("stuck" heuristic)
-- handle universe polymorphism
+- add flexible universes
 *)
