@@ -6,6 +6,7 @@ From MetaCoq.Template Require Import Ast AstUtils Typing Checker Evars Unificati
 Import MCMonadNotation.
 
 Local Set Universe Polymorphism.
+Unset Guard Checking.
 
 Inductive tactic_result A : Type :=
   | TacticSuccess : A -> tactic_result A 
@@ -39,6 +40,10 @@ Instance monad_TacticM : Monad TacticM :=
 }.
 
 (** * Basic TacticM bookkeeping. *)
+
+(** [fail_tac] is a tactic which always fails. *)
+Definition fail_tac {A} : TacticM A :=
+  fun _ _ _ _ => TacticError.
 
 (** Fetch the global environment. *)
 Definition get_global_env : TacticM global_env :=
@@ -76,10 +81,6 @@ Definition get_main_goal : TacticM evar :=
     | g :: goals => TacticSuccess (g, evm, g :: goals)
     end.
 
-(** [fail_tac] is a tactic which always fails. *)
-Definition fail_tac {A} : TacticM A :=
-  fun _ _ _ _ => TacticError.
-
 (** [with_evar_context ev t] executes tactic [t] in the context of evar [ev]. *)
 Definition with_evar_context {A} (ev : evar) (t : TacticM A) : TacticM A :=
   mlet evm <- get_evar_map ;;
@@ -87,6 +88,17 @@ Definition with_evar_context {A} (ev : evar) (t : TacticM A) : TacticM A :=
   | None => fail_tac 
   | Some entry => with_named_context entry.(ev_nctx) t
   end.
+
+(** [main_concl] returns the conclusion of the main goal,
+    and fails if there are no goals. *)
+Definition main_concl : TacticM term :=
+  mlet evm <- get_evar_map ;;
+  mlet goal <- get_main_goal ;;
+  match EvarMap.lookup evm goal with 
+  | None => fail_tac 
+  | Some entry => ret $ tEvar goal $ map (tVar <<< fst) entry.(ev_nctx)
+  end.
+
 
 (** Tactics which don't require a goal. *)
 
@@ -128,21 +140,36 @@ Definition fresh_evar (basename : ident) (ty_opt : option term) : TacticM term :
   (* Create ?x. *)
   fresh_evar_aux ty.
   
+(** [typeof_tac t] computes the type of [t], assuming it is well-typed.
+    If [t] is not well-typed, it might (but won't necessarily) fail. *)
+Definition typeof_tac (t : term) : TacticM term :=
+  mlet env <- get_global_env ;;
+  mlet nctx <- get_named_context ;;
+  mlet evm <- get_evar_map ;;
+  match retype evm env nctx [] t with 
+  | Checked ty => ret ty 
+  | TypeError _ => fail_tac
+  end.
+
 (** [unify_tac flags pb t1 t2] unifies [t1] and [t2] using unification flags [flags]
-    and conversion relation [pb], in the current named context.  *)
-Definition unify_tac (flags : UnifFlags.t) (pb : conv_pb) (t1 t2 : term) : TacticM (unif_result unit) :=
+    and conversion relation [pb], in the current named context.
+    It unification is successful it returns [true] and updates the evar map,
+    otherwise it returns [false] and leaves the evar map unchanged.  *)
+Definition unify_tac (flags : UnifFlags.t) (pb : conv_pb) (t1 t2 : term) : TacticM bool :=
   mlet env <- get_global_env ;;
   mlet nctx <- get_named_context ;;
   mlet evm <- get_evar_map ;;
   match @Unification.unify PrettyFlags.default env nctx [] pb t1 t2 evm flags with
-  | (_, UnifSuccess evm) => set_evar_map evm ;; ret (UnifSuccess tt)
-  | (_, UnifError) => fail_tac
+  | (_, UnifSuccess evm) => set_evar_map evm ;; ret true
+  | (_, UnifError) => ret false
   end.
 
-(** [assign_tac ev t] assigns [t] to evar [ev]. *)
+(** [assign_tac ev t] assigns [t] to evar [ev].
+    It fails if [ev] is already assigned. *)
 Definition assign_tac (ev : evar) (t : term) : TacticM unit :=
   mlet evm <- get_evar_map ;; 
-  set_evar_map $ EvarMap.define evm ev t.
+  if EvarMap.is_defined evm ev then fail_tac
+  else set_evar_map $ EvarMap.define evm ev t.
 
 (** * Tactics which work on a goal. *)
 
@@ -158,12 +185,6 @@ Definition simple_tactic {A} (t : evar -> TacticM (A * list evar)) : TacticM A :
     set_goals (new_goals ++ goals) ;;
     ret a
   end.
-
-(* ?goal[nctx] : forall x, P *)
-(* intro y. *)
-(* unify (forall x0 : ?x[nctx], ?y[nctx,,tRel 0]) (forall x, P) *)
-(* ?x:[nctx]  ?y:[nctx,,x0] *)
-(* set ?goal := fun x0 : ?x[nctx] => ?y[nctx,,tRel 0] *)
 
 (** [abstract x t] replaces all occurences of [tVar x] by [tRel 0] (modulo lifting) in [t]. *)
 Definition abstract (x : ident) (t : term) : term :=
@@ -196,12 +217,51 @@ Definition intro_tac (basename : ident) : TacticM ident :=
   mlet a <- fresh_evar "a" None ;;
   let body_nctx := nctx ,, (name, vass binder a) in
   mlet b <- with_named_context body_nctx (fresh_evar "b" None) ;;
-  (* Unify [forall x : ?a, ?b <=? goal]. *)
-  unify_tac UnifFlags.default Cumul 
-    (tProd binder a $ abstract name b)
-    (tEvar goal $ List.map (tVar <<< fst) nctx) ;;
+  (* Unify [forall x : ?a, ?b <=? typeof(goal)]. *)
+  mlet concl <- main_concl ;;
+  mlet unified <- unify_tac UnifFlags.default Cumul (tProd binder a $ abstract name b) concl ;;
+  (if unified then ret tt else fail_tac) ;;
   (* Set [?goal := fun x : ?a, ?body] *)
   mlet body <- with_named_context body_nctx (fresh_evar "goal" (Some b)) ;;
   assign_tac goal (tLambda binder a $ abstract name body) ;;
   (* Return the name of the introduced variable and the new goal. *)
   ret (name, [get_evar_id body]).
+
+(** [apply_tac t] works on the main goal : it applies the function [t]
+    and creates a new goal for each argument of [t]. *)
+Definition apply_tac (t : term) : TacticM unit :=
+  (* Create an evar for each argument of [t], until [t] applied to the arguments matches the conclusion.
+     [args] contains the evars created so far, most recent first.
+     [t_ty] is the type of [t] applied to the arguments. *)
+  let fix loop (args : list term) (t_ty : term) {struct t_ty} : TacticM (list term) :=
+    (* Check if we can apply [t] with the evars created so far. *)
+    mlet concl <- main_concl ;;
+    mlet can_apply <- unify_tac UnifFlags.default Cumul t_ty concl ;;
+    if can_apply then ret $ rev args else 
+    (* Otherwise, create an evar for the next argument of [t] and recurse. *)
+    (* TODO : weak-head reduce [t_ty]. *)
+    mlet evm <- get_evar_map ;;
+    match whd_evars evm t_ty with 
+    | tProd x x_ty t_ty =>
+      let ev_name := 
+        match x.(binder_name) with 
+        | nNamed n => n
+        | nAnon => "x"
+        end 
+      in 
+      mlet ev <- fresh_evar ev_name (Some $ subst0 args x_ty) ;;
+      loop (ev :: args) (subst0 [ev] t_ty)
+    (* No more arguments : the application has failed. *)
+    | _ => fail_tac 
+    end 
+  in 
+  simple_tactic $ fun goal => 
+  (* Create the arguments. *)
+  mlet t_ty <- typeof_tac t ;;
+  mlet args <- loop [] t_ty ;;
+  (* Apply [t] to the evar arguments and refine the goal. *)
+  assign_tac goal (mkApps t args) ;;
+  ret (tt, map get_evar_id args).
+
+(** [constructor_tac n] works on the main goal : if it is an inductive,
+    it applies the [n]-th constructor of this inductive. *)

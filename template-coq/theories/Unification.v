@@ -2,7 +2,7 @@
 
 From MetaCoq.Utils Require Import utils.
 From MetaCoq.Common Require Import BasicAst uGraph config.
-From MetaCoq.Template Require Import Ast AstUtils Typing Checker Retyping Evars Pretty.
+From MetaCoq.Template Require Import Ast AstUtils Typing Checker Evars Pretty.
 Import MCMonadNotation.
 
 Unset Guard Checking.
@@ -528,7 +528,6 @@ End Invert.
 
 Section Algorithm.
 Context `{PrettyFlags.t} (Σ : global_env) (Δ : named_context).
-Existing Instance default_fuel.
 Existing Instance default_checker_flags.
 
 (** * Term applications. *)
@@ -667,7 +666,7 @@ Definition intersect (flags : UnifFlags.t) evm (xs ys : list term) : option (lis
     match xs, ys with 
     | [], [] => Some diff
     | x :: xs, y :: ys =>
-      if eq_term_evars evm x y then loop (S i) xs ys diff 
+      if eq_term_evars evm Conv x y then loop (S i) xs ys diff 
       else if is_var x && is_var y then loop (S i) xs ys (i :: diff)
       else if UnifFlags.meta_same_aggressive flags then loop (S i) xs ys (i :: diff)
       else None
@@ -740,15 +739,14 @@ Fixpoint is_evarfree (t : term) : bool :=
   end.
 
 (** [try_conv Γ pb t t'] implements the Reduce-Same rule, which tries to unify evar-free terms
-    [t] and [t'] by checking conversion (currently is uses on the algorithm defined in Checker.v). *)
+    [t] and [t'] by checking conversion (currently is uses the algorithm defined in Checker.v). *)
 Definition try_conv Γ pb (t t' : tapp) evm : M (EvarMap.t) :=
   let t := mkApps t.1 t.2 in
   let t' := mkApps t'.1 t'.2 in
   if is_evarfree t && is_evarfree t' then 
-    match Checker.check_conv_gen pb Σ (EvarMap.evm_universes evm) Δ Γ t t' with 
-    | Checked tt => let* _ := log_str "Reduce-Same" in retM evm
-    | TypeError _ => failM $ str "Reduce-Same : not convertible"
-    end
+    if Checker.check_conv evm Σ Δ Γ pb t t' 
+    then let* _ := log_str "Reduce-Same" in retM evm
+    else failM $ str "Reduce-Same : not convertible"
   else failM $ str "Reduce-Same : terms contain evars".
 
 End TryConv.
@@ -757,6 +755,8 @@ End TryConv.
 
 Section TryAppFO.
 Context (unify : unif_fun term).
+
+Print comparison.
 
 (** Structurally unify the heads of two terms. *)
 Definition unify_head Γ pb (t t' : term) evm : M EvarMap.t :=
@@ -843,6 +843,20 @@ Definition unify_head Γ pb (t t' : term) evm : M EvarMap.t :=
       (* Unify the branches. *)
       ise_list2 (unify Γ Conv) bs_t bs_t' evm
     else failM $ str "Case-Same : not same head"
+  (* Int-Same *)
+  | tInt x, tInt x' =>
+    if x == x' then retM evm 
+    else failM $ str "Int-Same : not same head"
+  (* Float-Same *)
+  | tFloat x, tFloat x' =>
+    if x == x' then retM evm 
+    else failM $ str "Float-Same : not same head"
+  (* String-Same *)
+  | tString s, tString s' =>
+    match PrimString.compare s s' with 
+    | Eq => retM evm 
+    | _ => failM $ str "String-Same : not same head"
+    end
   | _, _ => failM $ str "Head-Same : not applicable"
   end.
 
@@ -1034,101 +1048,6 @@ End TryInstantiate.
 Section TryReduce.
 Context (unify : unif_fun term) (unify_tapp : unif_fun tapp).
 
-(** [whd_theta_tapp evm Γ t] weak-head reduces [t] using all reduction rules except unfolding 
-    (i.e. beta, zeta, iota, evar-expansion, cast-erasure).
-    Additionnally, it tries to reduce match scrutinees and fixpoint recursive arguments 
-    using _all_ rules (including unfolding), if it allows a iota reduction to trigger
-    (this is the theta rule in the Unicoq paper).
-    
-    It uses a call-by-name reduction strategy (i.e. it does not reduce arguments before 
-    substituting them). *)
-Definition whd_theta_tapp (evm : EvarMap.t) (Γ : context) (t : tapp) : tapp :=
-  (* This is a standard stack-based reduction machine. The flag [inside_arg] controls whether 
-     we are inside a match scrutinee or fixpoint argument. *)
-  let fix loop (inside_arg : bool) (t : tapp) {struct t} : tapp := 
-    match whd_tapp evm t with
-    
-    (* Delta-Γ reduction. *)
-    | (tRel n, args) => 
-      match inside_arg, nth_error Γ n with 
-      | true, Some {| decl_body := Some body |} => 
-        loop inside_arg (lift0 (S n) body, args)
-      | _, _ => (tRel n, args)
-      end
-    
-    (* Delta-Δ reduction. *)
-    | (tVar id, args) =>
-      match inside_arg, lookup_nctx Δ id with 
-      | true, Some {| decl_body := Some body |} => 
-        loop inside_arg (body, args)
-      | _, _ => (tVar id, args) 
-      end
-    
-    (* Delta-Σ reduction. *)
-    | (tConst c u, args) =>
-      match inside_arg, lookup_constant Σ c with 
-      | true, Some {| cst_body := Some body |} => 
-        loop inside_arg (subst_instance u body, args)
-      | _, _ => (tConst c u, args)
-      end  
-    
-    (* Beta reduction. *)
-    | (tLambda _ _ body, arg :: args) => loop inside_arg (subst0 [arg] body, args)
-    
-    (* Zeta-reduction. *)
-    | (tLetIn _ def _ body, args) => loop inside_arg (subst0 [def] body, args)
-    
-    (* Match-reduction. *)
-    | (tCase ci pred x bs, args) =>
-      (* If the (reduced) scrutinee is a constructor, reduce the match. *)
-      match loop true (x, []) with
-      | (tConstruct ind n _, x_args) =>
-        match nth_error bs n, lookup_constructor Σ ind n with
-        | Some branch, Some (mbody, _, cbody) =>
-          let bctx := case_branch_context ind mbody cbody pred branch in
-          loop inside_arg (iota_red ci.(ci_npar) x_args bctx branch, args)
-        | _, _ => (tCase ci pred x bs, args)
-        end
-      | _ => (tCase ci pred x bs, args)
-      end
-
-    (* Fix-reduction. *)
-    | (tFix mfix n, args) =>
-      (* Get the body of the fixpoint. *)
-      match unfold_fix mfix n with 
-      | Some (rec_idx, fix_body) =>
-        match chop rec_idx args with 
-        (* We have enough arguments to reduce. *)
-        | (args1, ra :: args2) =>
-          (* If the (reduced) recursive fixpoint argument is a constructor,
-             reduce the fixpoint. *)
-          match loop true (ra, []) with 
-          | (tConstruct _ _ _ as ra, ra_args) => 
-            loop inside_arg (fix_body, args1 ++ mkApps ra ra_args :: args2)
-          | _ => (tFix mfix n, args)
-          end
-        (* We don't have enough arguments to reduce. *)
-        | (args, []) => (tFix mfix n, args)
-        end 
-      | None => (tFix mfix n, args)
-      end
-
-    (* CoFix-Reduction. *)
-    | (tCoFix mfix n, args) =>
-      (* Get the body of the co-fixpoint. *)
-      match unfold_fix mfix n with 
-      | Some (_, cofix_body) => 
-        (* For co-fixpoints we don't need to wait for the recursive argument to be a constructor. *)
-        loop inside_arg (cofix_body, args) 
-      | None => (tFix mfix n, args)
-      end
-
-    (* No applicable rule. Note that evar-expansion and cast-erasure are done by [whd_tapp]. *)
-    | t => t
-    end
-  in
-  loop true t.
-
 (** [is_stuck evm Γ t] determines if [t] is stuck, in the sense that reducing it
     is useless. This is used to implement controlled backtracking. *)
 Definition is_stuck (evm : EvarMap.t) (Γ : context) (t : tapp) : bool :=
@@ -1140,8 +1059,9 @@ Definition is_stuck (evm : EvarMap.t) (Γ : context) (t : tapp) : bool :=
     | None => t
     end
   in
-  (* Weak-head reduce [t] using the specialized reduction strategy defined above. *)
-  let t := whd_theta_tapp evm Γ t in
+  (* Weak-head reduce [t] using a specialized reduction strategy.
+     See [whd_theta_stack] for more details. *)
+  let t := whd_theta_stack evm Σ Δ Γ t.1 t.2 in
   (* Check the head constructor. 
      NOTE : I include tVar here as it seems to make sense, 
      whereas the official unicoq implementation does not (probably a mistake ?). *)
@@ -1200,8 +1120,8 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Left, t.1 with 
     | true, tCase _ _ _ _ | true, tFix _ _ | true, tCoFix _ _ =>
       (* Reduce and check we made progress. *)
-      let t_new := whd_theta_tapp evm Γ t in
-      if eq_term_evars evm (mkApps t.1 t.2) (mkApps t_new.1 t_new.2) then 
+      let t_new := whd_theta_stack evm Σ Δ Γ t.1 t.2 in
+      if eq_term_evars evm Conv (mkApps t.1 t.2) (mkApps t_new.1 t_new.2) then 
         failM $ str "Red-Iota-L : no progress"
       else
         let* _ := log_str "Red-Iota-L" in 
@@ -1214,8 +1134,8 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Right, t'.1 with 
     | true, tCase _ _ _ _ | true, tFix _ _ | true, tCoFix _ _ =>
       (* Reduce and check we made progress. *)
-      let t_new' := whd_theta_tapp evm Γ t' in
-      if eq_term_evars evm (mkApps t'.1 t'.2) (mkApps t_new'.1 t_new'.2) then 
+      let t_new' := whd_theta_stack evm Σ Δ Γ t'.1 t'.2 in
+      if eq_term_evars evm Conv (mkApps t'.1 t'.2) (mkApps t_new'.1 t_new'.2) then 
         failM $ str "Red-Iota-R : no progress"
       else 
         let* _ := log_str "Red-Iota-R" in 
@@ -1228,7 +1148,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Left, unfold_def Γ t.1 evm with 
     | true, Some def =>
       let* _ := log_str "Cons-Delta-L" in 
-      let t_new := whd_theta_tapp evm Γ (def, t.2) in
+      let t_new := whd_theta_stack evm Σ Δ Γ def t.2 in
       unify_tapp Γ pb t_new t' evm
     | _, _ => failM $ str "Cons-Delta-L : not applicable"
     end
@@ -1238,7 +1158,7 @@ Definition try_reduce Γ pb (t t' : tapp) evm : M EvarMap.t :=
     match can_reduce Right, unfold_def Γ t'.1 evm with 
     | true, Some def' =>
       let* _ := log_str "Cons-Delta-R" in 
-      let t_new' := whd_theta_tapp evm Γ (def', t'.2) in
+      let t_new' := whd_theta_stack evm Σ Δ Γ def' t'.2 in
       unify_tapp Γ pb t t_new' evm
     | _, _ => failM $ str "Cons-Delta-R : not applicable"
     end
@@ -1342,7 +1262,7 @@ Definition test :=
 Eval vm_compute in test.*)
 
 (* TODO : 
-- fix generation of universe constraints (maybe ask Yannick for help)
+- investigate generation of universe constraints (maybe ask Matthieu for help)
 - add controlled backtracking ("stuck" heuristic)
-- add flexible universes
+- reduce primitive projections.
 *)

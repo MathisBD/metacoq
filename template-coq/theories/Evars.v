@@ -135,6 +135,13 @@ Definition empty : t :=
   ;  evm_counter := 0
   ;  evm_universes := uGraph.init_graph |}.
 
+(** [from_ugraph ugraph] creates an evar map which contains no evars
+    and has a universe graph equal to [ugraph]. *)
+Definition from_ugraph (ugraph : universes_graph) : t := 
+  {| evm_map := @EMap.empty evar_entry 
+  ;  evm_counter := 0
+  ;  evm_universes := ugraph |}.
+
 (** Lookup the entry of an evar in the evar map. *)
 Definition lookup (evm : t) (ev : evar) : option evar_entry :=
   EMap.find ev evm.(evm_map).

@@ -75,7 +75,7 @@ Notation "'$quote_def_rec' x" :=
 
 (** [term_eqb t1 t2] checks if [t1] and [t2] are equal modulo alpha equivalence. *)
 Definition term_eqb (t1 t2 : term) :=
-  @eq_term config.default_checker_flags init_graph t1 t2.
+  @eq_term config.default_checker_flags init_graph Conv t1 t2.
 
 (** Short-form notation for [tLambda]. *)
 Notation tLam x A b :=
