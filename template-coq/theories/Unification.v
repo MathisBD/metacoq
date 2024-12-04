@@ -106,7 +106,7 @@ Definition set_reduce_side (s : Side.t) (flags : t) : t :=
   ;  meta_same_aggressive := flags.(meta_same_aggressive)
   ;  reduce_side          := s 
   ;  inst_side            := flags.(inst_side)
-  ;  inst_evars           := flags.(inst_evars) |}.
+  ;  inst_evars           := flags.(inst_evars)|}.
   
 (** Modify the [inst_side] in some flags. *)
 Definition set_inst_side (s : Side.t) (flags : t) : t :=
@@ -122,11 +122,11 @@ End UnifFlags.
 
 (** Unification returns a [unif_result]. *)
 Inductive unif_result A : Type := 
-  (** [Success x] : unification succeeded with result [x] (typically the updated evar map). *)
-  | Success : A -> unif_result A
+  (** [UnifSuccess x] : unification succeeded with result [x] (typically the updated evar map). *)
+  | UnifSuccess : A -> unif_result A
   (** [UnifError] : unification failed. Look at the log for additional details. *)
   | UnifError : unif_result A.
-Arguments Success {A}%_type_scope a.
+Arguments UnifSuccess {A}%_type_scope a.
 Arguments UnifError {A}%_type_scope.
 
 (** * Logging. *)
@@ -194,7 +194,7 @@ with print_node (n : node t) (u : unit) {struct u} : doc unit :=
   (* Print the result. *)
   let res :=
     match n.(res) with 
-    | Success _ => str "[success]"
+    | UnifSuccess _ => str "[success]"
     | UnifError => str "[error]"
     end 
   in
@@ -219,7 +219,7 @@ End Log.
 Definition M A := UnifFlags.t -> Log.t * unif_result A. 
 
 (** Monadic return. *)
-Definition retM {A} (a : A) : M A := fun _ => (Log.empty, Success a).
+Definition retM {A} (a : A) : M A := fun _ => (Log.empty, UnifSuccess a).
 
 (** [failM err] writes [err] to the log and returns [UnifError] *)
 Definition failM {A} (err : doc unit) : M A := 
@@ -233,7 +233,7 @@ Definition failM {A} (err : doc unit) : M A :=
 Definition bindM {A} {B} (ma : M A) (mf : A -> M B) : M B :=
   fun flags =>
     match ma flags with 
-    | (l, Success a) => let (l', res) := mf a flags in (Log.append l l', res)
+    | (l, UnifSuccess a) => let (l', res) := mf a flags in (Log.append l l', res)
     | (l, UnifError) => (l, UnifError)
     end.
 Notation "'let*' x := c1 'in' c2" := (bindM c1 (fun x => c2))
@@ -249,7 +249,7 @@ Instance monad_M : Monad M :=
 Definition orM {A} (mx my : M A) : M A :=
   fun flags =>
     match mx flags with 
-    | (l, Success x) => (l, Success x)
+    | (l, UnifSuccess x) => (l, UnifSuccess x)
     | (l, UnifError) => 
       let (l', y) := my flags in 
       match UnifFlags.log_lvl flags with 
@@ -267,16 +267,16 @@ Definition whenM (cond : bool) (x : M unit) : M unit :=
 Definition log_str (s : string) : M unit :=
   fun flags =>
     match UnifFlags.log_lvl flags with 
-    | LogSilent => (Log.empty, Success tt)
-    | _ => (Log.Log [inr $ str s], Success tt)
+    | LogSilent => (Log.empty, UnifSuccess tt)
+    | _ => (Log.Log [inr $ str s], UnifSuccess tt)
     end.
 
 (** Log a document. *)
 Definition log_doc (d : doc unit) : M unit :=
   fun flags => 
     match UnifFlags.log_lvl flags with 
-    | LogSilent => (Log.empty, Success tt)
-    | _ => (Log.Log [inr d], Success tt)
+    | LogSilent => (Log.empty, UnifSuccess tt)
+    | _ => (Log.Log [inr d], UnifSuccess tt)
     end.
   
 (** Log a unification (sub)problem. It collects the logs of [problem],
@@ -301,7 +301,7 @@ Definition liftM {A} (x : option A) (msg : doc unit) : M A :=
 
 (** Get the unification flags. *)
 Definition get_unif_flags : M UnifFlags.t :=
-  fun flags => (Log.empty, Success flags).
+  fun flags => (Log.empty, UnifSuccess flags).
 
 (** [with_unif_flags flags x] runs the computation [x] with unification flags
     set to [flags]. *)
@@ -527,8 +527,9 @@ End Invert.
 (** * Unification algorithm. *)
 
 Section Algorithm.
-Context `{PrettyFlags.t} `{checker_flags} (Σ : global_env) (Δ : named_context).
-Existing Instance Checker.default_fuel.
+Context `{PrettyFlags.t} (Σ : global_env) (Δ : named_context).
+Existing Instance default_fuel.
+Existing Instance default_checker_flags.
 
 (** * Term applications. *)
 
@@ -1300,7 +1301,7 @@ End Algorithm.
 (*************************************************************************************)
 (** * Testing *)
 
-From MetaCoq.Template Require Import All.
+(*From MetaCoq.Template Require Import All.
 
 Definition env := fst ($quote_rec (nat, app, In)).
 
@@ -1338,7 +1339,7 @@ Definition test :=
   in
   (res_str, log_str).
 
-Eval vm_compute in test.
+Eval vm_compute in test.*)
 
 (* TODO : 
 - fix generation of universe constraints (maybe ask Yannick for help)

@@ -11,11 +11,11 @@ From MetaCoq.Common Require Import BasicAst Environment uGraph config.
 From MetaCoq.Template Require Import Ast AstUtils Typing Pretty.
 Import MCMonadNotation.
     
+Local Set Universe Polymorphism.
 Unset Guard Checking.
 
 (** A convenient notation for function application, which saves many parentheses. *)
-#[local]
-Notation "f $ x" := (f x) 
+Local Notation "f $ x" := (f x) 
   (at level 10, x at level 100, right associativity, only parsing).
 
 (** [lexpr_leq_constraints l1 l2] computes the universe constraints to encode [l1 <= l2]. *)
@@ -287,7 +287,8 @@ End EvarMap.
 
 (** [subst_var v t u] replaces all occurences of [v] by [t] in [u].
     It assumes [t] contains no loose tRel (i.e. it does not perform lifting). *)
-Fixpoint subst_var (v : ident) (t u : term) : term :=
+(* Note : I have to make this monomorphic, otherwise Coq creates a bazillion universes here. *)
+Monomorphic Fixpoint subst_var (v : ident) (t u : term) : term :=
   match u with 
   | tVar v' => if v == v' then t else tVar v'
   | _ => map_term (subst_var v t) u

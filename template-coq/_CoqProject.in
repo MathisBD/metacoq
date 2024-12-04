@@ -23,6 +23,7 @@ theories/EtaExpand.v
 theories/TemplateProgram.v
 theories/Evars.v
 theories/Retyping.v
+theories/Unification.v
 
 # The Template monad
 theories/TemplateMonad.v
