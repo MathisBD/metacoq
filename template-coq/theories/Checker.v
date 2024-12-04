@@ -6,7 +6,229 @@ Import MCMonadNotation.
 
 Unset Guard Checking.
 
-(** TODO : header *)
+(** This file implements :
+    - several variants of alpha equivalence on terms 
+      (e.g. with or without unfolding evars or removing casts) :
+      [eq_term], [eq_term_evars].
+    - reduction (both strong reduction and weak-head reduction) 
+      with arbitrary reduction flags : [reduce] and [weak_head_reduce].
+    - conversion and cumulativity checking with arbitrary reduction flags : 
+      [check_conv].
+    - type inference, type checking and retyping for terms :
+      [infer], [check] and [retype].
+    
+    It is intended for practical use and is not verified 
+    (we even disable the guard checker). *)
+
+(** * Alpha equivalence. *)
+
+(** [rebuild_case env ci pred bs] rebuilds the terms corresponding to the 
+    case predicate and branches of [tCase ci pred _ bs]. 
+    This involves adding lambda abstractions and let-ins as needed. *)
+Definition rebuild_case Σ ci pred bs : option (term * list term) :=
+  match lookup_inductive Σ ci.(ci_ind) with 
+  | None => None 
+  | Some (mbody, body) =>
+    (* Add abstractions to the predicate. *)
+    let pred_ctx := case_predicate_context ci.(ci_ind) mbody body pred in
+    let pred_term := it_mkLambda_or_LetIn pred_ctx pred.(preturn) in 
+    (* Add abstractions to each branch. *)
+    let bs_terms := 
+      map2 
+        (fun b cbody =>
+          let b_ctx := case_branch_context ci.(ci_ind) mbody cbody pred b in
+          it_mkLambda_or_LetIn b_ctx b.(bbody))
+        bs
+        body.(ind_ctors)
+    in
+    (* Return the updated predicate and branches. *)
+    Some (pred_term, bs_terms)
+  end.
+
+Section EqTermGen.
+Context `{checker_flags} (φ : universes_graph).
+Context (on_subterms : conv_pb -> term -> term -> bool).
+
+(** [eq_term_gen pb t t'] compares [t] and [t'] for conversion (if [pb] is Conv)
+    or cumulativity (if [pb] is Cumul).
+    It compares the head-constructors of [t] and [t'] without reducing, 
+    and uses [on_subterms] to compare subterms. *)
+Definition eq_term_gen pb (t t' : term) : bool :=
+  match t, t' with 
+  (* Type-Same *)
+  | tSort s, tSort s' =>
+    match pb with 
+    | Conv => check_eqb_sort φ s s' 
+    | Cumul => check_leqb_sort φ s s'
+    end
+  (* Lam-Same *)
+  | tLambda x ty body, tLambda _ ty' body' =>
+    on_subterms Conv ty ty' && on_subterms pb body body'
+  (* Prod-Same *)
+  | tProd x a b, tProd _ a' b' =>
+    on_subterms Conv a a' && on_subterms pb b b'
+  (* Let-Same *)
+  | tLetIn x def ty body, tLetIn _ def' ty' body' =>
+    on_subterms Conv def def' && on_subterms pb body body'
+  (* Rel-Same *)
+  | tRel n, tRel n' => n == n'
+  (* Var-Same *)
+  | tVar v, tVar v' => v == v'
+  (* Const-Same *)
+  | tConst c u, tConst c' u' => 
+    (c == c') && eqb_univ_instance φ u u'
+  (* Ind-Same *)
+  | tInd ind u, tInd ind' u' => 
+    (ind == ind') && eqb_univ_instance φ u u'
+  (* Construct-Same *)
+  | tConstruct ind n u, tConstruct ind' n' u' =>
+    (ind == ind') && (n == n') && eqb_univ_instance φ u u'
+  (* Proj-Same *)
+  | tProj p t, tProj p' t' =>
+    (p == p') && on_subterms Conv t t' 
+  (* (Co)Fix-Same *)
+  | tFix defs n, tFix defs' n'
+  | tCoFix defs n, tCoFix defs' n' =>
+    (n == n') && 
+    (* First compare the types. *)
+    forallb2 (fun d d' => on_subterms Conv d.(dtype) d'.(dtype)) defs defs' &&
+    (* Then compare the bodies. *)
+    forallb2 (fun d d' => on_subterms Conv d.(dbody) d.(dbody)) defs defs'
+  (* Case-Same *)
+  | tCase ci pred x bs, tCase ci' pred' x' bs' =>
+    (ci == ci') && 
+    eqb_predicate (eqb_univ_instance φ) (on_subterms Conv) pred pred' &&
+    on_subterms Conv x x' &&
+    forallb2 (fun b b' => on_subterms Conv b.(bbody) b'.(bbody)) bs bs'
+  (* Int-Same *)
+  | tInt x, tInt x' => x == x'
+  (* Float-Same *)
+  | tFloat x, tFloat x' => x == x'
+  (* String-Same *)
+  | tString s, tString s' =>
+    match PrimString.compare s s' with 
+    | Eq => true 
+    | _ => false
+    end
+  (* Array-Same *)
+  | tArray l ts t1 t2, tArray l' ts' t1' t2' =>
+    eqb_univ_instance φ [l] [l'] &&
+    forallb2 (on_subterms Conv) (t1 :: t2 :: ts) (t1' :: t2' :: ts')
+  | _, _ => false
+  end.
+
+End EqTermGen.
+
+Section EqTermCtx.
+Context `{checker_flags} (Σ : global_env) (φ : universes_graph).
+Context (on_subterms : context -> conv_pb -> term -> term -> bool).
+
+(** Helper function to compare case predicates. *)
+Definition on_predicates ind Γ pred pred' : bool :=
+  eqb_univ_instance φ pred.(puinst) pred'.(puinst) &&
+  match lookup_inductive Σ ind with 
+  | Some (mbody, ibody) =>
+    let Γ_pred := Γ ,,, case_predicate_context ind mbody ibody pred in
+    on_subterms Γ_pred Conv pred.(preturn) pred'.(preturn)
+  | None => false 
+  end.
+
+(** Helper function to compare case branches. *)
+Definition on_branches ind i pred Γ branch branch' : bool :=
+  match lookup_constructor Σ ind i with 
+  | Some (mbody, ibody, cbody) =>
+    let Γ_branch := Γ ,,, case_branch_context ind mbody cbody pred branch in
+    on_subterms Γ_branch Conv branch.(bbody) branch'.(bbody)
+  | None => false 
+  end.
+
+(** Same as [eq_term_ctx], but it threads a local context. 
+    This requires access to a global environment (to rebuild the context 
+    of case predicates and branches). *)
+Definition eq_term_ctx Γ pb (t t' : term) : bool :=
+  match t, t' with 
+  (* Type-Same *)
+  | tSort s, tSort s' =>
+    match pb with 
+    | Conv => check_eqb_sort φ s s' 
+    | Cumul => check_leqb_sort φ s s'
+    end
+  (* Lam-Same *)
+  | tLambda x ty body, tLambda _ ty' body' =>
+    on_subterms Γ Conv ty ty' && on_subterms (Γ ,, vass x ty) pb body body'
+  (* Prod-Same *)
+  | tProd x a b, tProd _ a' b' =>
+    on_subterms Γ Conv a a' && on_subterms (Γ ,, vass x a) pb b b'
+  (* Let-Same *)
+  | tLetIn x def ty body, tLetIn _ def' ty' body' =>
+    on_subterms Γ Conv def def' && on_subterms (Γ ,, vdef x def ty) pb body body'
+  (* Rel-Same *)
+  | tRel n, tRel n' => n == n'
+  (* Var-Same *)
+  | tVar v, tVar v' => v == v'
+  (* Const-Same *)
+  | tConst c u, tConst c' u' => 
+    (c == c') && eqb_univ_instance φ u u'
+  (* Ind-Same *)
+  | tInd ind u, tInd ind' u' => 
+    (ind == ind') && eqb_univ_instance φ u u'
+  (* Construct-Same *)
+  | tConstruct ind n u, tConstruct ind' n' u' =>
+    (ind == ind') && (n == n') && eqb_univ_instance φ u u'
+  (* Proj-Same *)
+  | tProj p t, tProj p' t' =>
+    (p == p') && on_subterms Γ Conv t t' 
+  (* (Co)Fix-Same *)
+  | tFix defs n, tFix defs' n'
+  | tCoFix defs n, tCoFix defs' n' =>
+    (n == n') && 
+    (* First compare the types. *)
+    forallb2 (fun d d' => on_subterms Γ Conv d.(dtype) d'.(dtype)) defs defs' &&
+    (* Then compare the bodies in an extended context. *)
+    let Γ_fix := Γ ,,, fix_context defs in
+    forallb2 (fun d d' => on_subterms Γ_fix Conv d.(dbody) d.(dbody)) defs defs'
+  (* Case-Same *)
+  | tCase ci pred x bs, tCase ci' pred' x' bs' =>
+    (ci == ci') && 
+    on_subterms Γ Conv x x' &&
+    on_predicates ci.(ci_ind) Γ pred pred' &&
+    forallb (fun '(i, b, b') => on_branches ci.(ci_ind) i pred Γ b b') (map2i (fun i b b' => (i, b, b')) bs bs')
+  (* Int-Same *)
+  | tInt x, tInt x' => x == x'
+  (* Float-Same *)
+  | tFloat x, tFloat x' => x == x'
+  (* String-Same *)
+  | tString s, tString s' =>
+    match PrimString.compare s s' with 
+    | Eq => true 
+    | _ => false
+    end
+  (* Array-Same *)
+  | tArray l ts t1 t2, tArray l' ts' t1' t2' =>
+    eqb_univ_instance φ [l] [l'] &&
+    forallb2 (on_subterms Γ Conv) (t1 :: t2 :: ts) (t1' :: t2' :: ts')
+  | _, _ => false
+  end.
+
+End EqTermCtx.
+
+(** Equality of terms modulo :
+    - alpha equivalence.
+    - universe equivalence/cumulativity. *)
+Fixpoint eq_term `{checker_flags} φ pb t u : bool := 
+  eq_term_gen φ (eq_term φ) pb t u.
+
+(** Equality of terms modulo :
+    - alpha equivalence.
+    - universe equivalence/cumulativity.
+    - evar expansion. *)
+Fixpoint eq_term_evars `{checker_flags} evm pb t u : bool := 
+  let on_subterms pb t u :=
+    eq_term_evars evm pb (whd_evars evm t) (whd_evars evm u)
+  in
+  eq_term_gen (EvarMap.evm_universes evm) on_subterms pb (whd_evars evm t) (whd_evars evm u).
+
+(** * Reduction. *)
 
 (** Reduction flags control which reduction rules to apply. *)
 Module RedFlags.
@@ -38,142 +260,6 @@ Definition all : t :=
   mk true true true true true true true true true true.
 
 End RedFlags.
-
-Inductive type_error :=
-| UnboundRel (n : nat)
-| UnboundVar (id : string)
-| UnboundMeta (m : nat)
-| UnboundEvar (ev : nat)
-| UndeclaredConstant (c : kername)
-| UndeclaredInductive (c : inductive)
-| UndeclaredConstructor (c : inductive) (i : nat)
-| UndeclaredProjection (p : projection)
-| NotConvertible (Γ : context) (t u t' u' : term)
-| NotASort (t : term)
-| NotAProduct (t t' : term)
-| NotAnInductive (t : term)
-| IllFormedFix (m : mfixpoint term) (i : nat)
-| IllFormedProjection (p : projection) (t : term)
-| UnsatisfiedConstraints (c : ConstraintSet.t)
-| UnsatisfiableConstraints (c : ConstraintSet.t)
-| NotSupported (s : string).
-
-Definition string_of_type_error (e : type_error) : string :=
-  match e with
-  | UnboundRel n => "Unboound rel " ^ string_of_nat n
-  | UnboundVar id => "Unbound var " ^ id
-  | UnboundMeta m => "Unbound meta " ^ string_of_nat m
-  | UnboundEvar ev => "Unbound evar " ^ string_of_nat ev
-  | UndeclaredConstant c => "Undeclared constant " ^ string_of_kername c
-  | UndeclaredInductive c => "Undeclared inductive " ^ string_of_kername (inductive_mind c)
-  | UndeclaredConstructor c i => "Undeclared constructor for inductive " ^ string_of_kername (inductive_mind c)
-  | UndeclaredProjection p => "Undeclared projection for for inductive " ^ string_of_kername (inductive_mind p.(proj_ind))
-  | NotConvertible Γ t u t' u' => "Terms are not convertible: " ^
-      string_of_term t ^ " " ^ string_of_term u ^ " after reduction: " ^
-      string_of_term t' ^ " " ^ string_of_term u'
-  | NotASort t => "Not a sort"
-  | NotAProduct t t' => "Not a product"
-  | NotAnInductive t => "Not an inductive"
-  | IllFormedFix m i => "Ill-formed recursive definition"
-  | IllFormedProjection p t => "Ill-formed primitive projection"
-  | UnsatisfiedConstraints c => "Unsatisfied constraints"
-  | UnsatisfiableConstraints c => "Unsatisfiable constraints"
-  | NotSupported s => s ^ " are not supported"
-  end.
-
-Inductive typing_result (A : Type) :=
-| Checked (a : A)
-| TypeError (t : type_error).
-Global Arguments Checked {A} a.
-Global Arguments TypeError {A} t.
-
-Global Instance typing_monad : Monad typing_result :=
-{| ret A a := Checked a ;
-   bind A B m f :=
-     match m with
-     | Checked a => f a
-     | TypeError t => TypeError t
-     end
-|}.
-
-Global Instance monad_exc : MonadExc type_error typing_result :=
-{ raise A e := TypeError e;
-  catch A m f :=
-    match m with
-    | Checked a => m
-    | TypeError t => f t
-    end
-}.
-
-Section Lookups.
-  Context (Σ : global_env).
-
-  Definition polymorphic_constraints u :=
-    match u with
-    | Monomorphic_ctx => ConstraintSet.empty
-    | Polymorphic_ctx ctx => (AUContext.repr ctx).2.2
-    end.
-
-  Definition lookup_constant_type cst u :=
-    match lookup_env Σ cst with
-    | Some (ConstantDecl {| cst_type := ty; cst_universes := uctx |}) =>
-      ret (subst_instance u ty)
-    |  _ => raise (UndeclaredConstant cst)
-    end.
-
-  Definition lookup_constant_type_cstrs cst u :=
-    match lookup_env Σ cst with
-    | Some (ConstantDecl {| cst_type := ty; cst_universes := uctx |}) =>
-      let cstrs := polymorphic_constraints uctx in
-      ret (subst_instance u ty, subst_instance_cstrs u cstrs)
-      |  _ => raise (UndeclaredConstant cst)
-    end.
-
-  Definition lookup_ind_decl ind i :=
-    match lookup_env Σ ind with
-    | Some (InductiveDecl mdecl) =>
-      match nth_error mdecl.(ind_bodies) i with
-      | Some body => ret (mdecl, body)
-      | None => raise (UndeclaredInductive (mkInd ind i))
-      end
-    | _ => raise (UndeclaredInductive (mkInd ind i))
-    end.
-
-  Definition lookup_ind_type ind i (u : list Level.t) :=
-    res <- lookup_ind_decl ind i ;;
-    ret (subst_instance u (snd res).(ind_type)).
-
-  Definition lookup_ind_type_cstrs ind i (u : list Level.t) :=
-    '(mib, body) <- lookup_ind_decl ind i ;;
-    let uctx := mib.(ind_universes) in
-    let cstrs := polymorphic_constraints uctx in
-    ret (subst_instance u body.(ind_type), subst_instance_cstrs u cstrs).
-
-  Definition lookup_constructor_decl ind i k :=
-    '(mib, body) <- lookup_ind_decl ind i;;
-    match nth_error body.(ind_ctors) k with
-    | Some cdecl => ret (mib, cdecl)
-    | None => raise (UndeclaredConstructor (mkInd ind i) k)
-    end.
-
-  Definition lookup_constructor_type ind i k u :=
-    '(mib, cdecl) <- lookup_constructor_decl ind i k ;;
-    ret (subst0 (inds ind u mib.(ind_bodies)) (subst_instance u cdecl.(cstr_type))).
-
-  Definition lookup_constructor_type_cstrs ind i k u :=
-    '(mib, cdecl) <- lookup_constructor_decl ind i k ;;
-    let cstrs := polymorphic_constraints mib.(ind_universes) in
-    ret (subst0 (inds ind u mib.(ind_bodies)) (subst_instance u cdecl.(cstr_type)),
-        subst_instance_cstrs u cstrs).
-
-  Definition lookup_projection_type p c args u :=
-    match lookup_projection Σ p with
-    | Some (_, _, _, pbody) =>
-      ret (subst0 (c :: rev args) (subst_instance u pbody.(proj_type)))
-    | None => raise (UndeclaredProjection p)
-    end.
-
-End Lookups.
 
 Section Reduce.
 Context (flags : RedFlags.t) (evm : EvarMap.t) (Σ : global_env) (Δ : named_context).
@@ -248,8 +334,8 @@ Fixpoint weak_head_stack (Γ : context) (t : term) (stack : list term) {struct t
     if RedFlags.case flags then
       match weak_head_stack Γ c [] with
       | (tConstruct ind ctor_idx _, args) =>
-        match nth_error brs ctor_idx, lookup_constructor_decl Σ ind.(inductive_mind) ind.(inductive_ind) ctor_idx with
-        | Some br, Checked (mdecl, cdecl) =>
+        match nth_error brs ctor_idx, lookup_constructor Σ ind ctor_idx with
+        | Some br, Some (mdecl, _, cdecl) =>
           let bctx := case_branch_context ind mdecl cdecl p br in
           weak_head_stack Γ (iota_red ci.(ci_npar) args bctx br) stack
         | _, _ => (t, stack)
@@ -300,9 +386,9 @@ Definition weak_head_reduce (Γ : context) (t : term) : term :=
   let (f, args) := weak_head_stack Γ t [] in mkApps f args.
 
 Definition rebuild_case_predicate_ctx ind (p : predicate term) : context :=
-  match lookup_ind_decl Σ (inductive_mind ind) (inductive_ind ind) with
-  | TypeError _ => []
-  | Checked (mib, oib) => case_predicate_context ind mib oib p
+  match lookup_inductive Σ ind with
+  | Some (mib, oib) => case_predicate_context ind mib oib p
+  | None => []
   end.
 
 Definition map_context_with_binders (f : context -> term -> term) (c : context) Γ : context :=
@@ -317,9 +403,9 @@ Definition map_predicate_with_binders (f : context -> term -> term) Γ ind (p : 
      preturn := f Γ' (preturn p) |}.
 
 Definition rebuild_case_branch_ctx ind i p br :=
-  match lookup_constructor_decl Σ (inductive_mind ind) (inductive_ind ind) i with
-  | TypeError _ => []
-  | Checked (mib, cdecl) => case_branch_context ind mib cdecl p br
+  match lookup_constructor Σ ind i with
+  | None => []
+  | Some (mib, _, cdecl) => case_branch_context ind mib cdecl p br
   end.
 
 Definition map_case_branch_with_binders ind i (f : context -> term -> term) Γ p br :=
@@ -452,245 +538,168 @@ Definition whd_theta_stack (Γ : context) (t : term) (args : list term) : term *
       
 End ThetaReduce.
 
-Section EqTermGen.
-Context `{checker_flags} (evm : EvarMap.t) (expand_evars : bool) (φ : universes_graph).
-
-(** [eq_term_gen expand_evars φ pb t u] checks equality of [t = u] up to :
-    - alpha equivalence.
-    - universe equivalence (if [pb] is Conv) or universe cumulativity (if [pb] is Cumul).
-    - evar expansion (if [expand_evars] is set). *)
-Fixpoint eq_term_gen (pb : conv_pb) (t u : term) {struct t} :=
-  let t := if expand_evars then whd_evars evm t else t in
-  let u := if expand_evars then whd_evars evm u else u in
-  match t, u with
-  | tRel n, tRel n' => (n == n')
-  | tEvar ev args, tEvar ev' args' => 
-    (ev == ev') && forallb2 (eq_term_gen Conv) args args'
-  | tVar id, tVar id' => id == id'
-  | tSort s, tSort s' => 
-    match pb with 
-    | Conv => check_eqb_sort φ s s'
-    | Cumul => check_leqb_sort φ s s' 
-    end
-  | tCast f k T, tCast f' k' T' => 
-    (* TODO : should we use [pb] here ? *)
-    eq_term_gen Conv f f' && eq_term_gen Conv T T'
-  | tApp f args, tApp f' args' => 
-    eq_term_gen pb f f' && forallb2 (eq_term_gen Conv) args args'
-  | tConst c u, tConst c' u' => (c == c') && eqb_univ_instance φ u u'
-  | tInd i u, tInd i' u' => (i == i') && eqb_univ_instance φ u u'
-  | tConstruct i k u, tConstruct i' k' u' => 
-    (i == i') && (k == k') && eqb_univ_instance φ u u'
-  | tLambda _ b t, tLambda _ b' t' => eq_term_gen Conv b b' && eq_term_gen pb t t'
-  | tProd _ b t, tProd _ b' t' => eq_term_gen Conv b b' && eq_term_gen pb t t'
-  | tLetIn _ b t c, tLetIn _ b' t' c' => 
-    eq_term_gen Conv b b' && eq_term_gen Conv t t' && eq_term_gen pb c c'
-  | tCase ci p c brs, tCase ci' p' c' brs' =>
-    (ci == ci') && eqb_predicate (eqb_univ_instance φ) (eq_term_gen Conv) p p' && eq_term_gen Conv c c' && 
-    forallb2 (fun br br' => eq_term_gen Conv br.(bbody) br'.(bbody)) brs brs'
-  | tProj p c, tProj p' c' => eq_projection p p' && eq_term_gen Conv c c'
-  | tFix mfix idx, tFix mfix' idx' =>
-    forallb2 (fun x y =>
-                eq_term_gen Conv x.(dtype) y.(dtype) && eq_term_gen Conv x.(dbody) y.(dbody)) mfix mfix' &&
-    (idx == idx')
-  | tCoFix mfix idx, tCoFix mfix' idx' =>
-    forallb2 (fun x y =>
-                eq_term_gen Conv x.(dtype) y.(dtype) && eq_term_gen Conv x.(dbody) y.(dbody)) mfix mfix' &&
-    (idx == idx')
-  | _, _ => false
-  end.
-
-End EqTermGen.
-
-(** Conversion of terms modulo alpha equivalence and universe equivalence/cumulativity. *)
-Definition eq_term `{checker_flags} φ pb t u : bool := 
-  eq_term_gen EvarMap.empty false φ pb t u.
-
-(** Conversion of terms modulo alpha equivalence, evar expansion 
-    and universe equivalence/cumulativity. *)
-Definition eq_term_evars `{checker_flags} evm pb t u : bool := 
-  eq_term_gen evm true (EvarMap.evm_universes evm) pb t u.
+(** Conversion. *)
 
 Section Conversion.
-Context `{checker_flags} (flags : RedFlags.t).
-Context (evm : EvarMap.t) (Σ : global_env) (Δ : named_context).
+Context `{checker_flags} (flags : RedFlags.t) (evm : EvarMap.t) (Σ : global_env) (Δ : named_context).
 
-(*Definition unfold_one_fix n Γ mfix idx l : option term :=
-  mlet '(arg, fn) <- unfold_fix mfix idx ;;
-  mlet c <- nth_error l arg ;;
-  mlet '(cred, _) <- weak_head_stack RedFlags.all evm Σ Δ Γ n c [] ;;
-  match cred with 
-  | tConstruct _ _ _ => Some fn 
-  | _ => None 
-  end.
-  
-Definition unfold_one_case n Γ c : option term :=
-  mlet cred <- weak_head_stack RedFlags.all evm Σ Δ Γ n c [] ;;  
-  match cred with 
-  | (tConstruct _ _ _, _) | (tCoFix _ _, _) => Some (zip cred) 
-  | _ => None 
-  end.
-
-Definition reducible_head n Γ c l :=
-  match c with
-  | tFix mfix idx => unfold_one_fix n Γ mfix idx l
-  | tCase ind' p' c' brs =>
-    match unfold_one_case n Γ c' with
-    | None => None
-    | Some c' => Some (tCase ind' p' c' brs)
-    end
-  | tProj p c =>
-    match unfold_one_case n Γ c with
-    | None => None
-    | Some c' => Some (tProj p c')
-    end
-  | tConst c _ => (* TODO Universes *)
-    match lookup_env Σ c with
-    | Some (ConstantDecl {| cst_body := Some body |}) => Some body
-    | _ => None
-    end
-  | tVar v =>  
-    match lookup_nctx Δ v with 
-    | Some decl => decl.(decl_body)
-    | None => None 
-    end
-  | _ => None
-  end.
-
-Definition opt_bool_to_bool (x : option bool) : bool :=
-  match x with
-  | Some b => b
-  | None => false
-  end.
-
-Fixpoint isconv (n : nat) (pb : conv_pb) (Γ : context) 
-  (t1 : term) (l1 : list term) (t2 : term) (l2 : list term) {struct n} : bool :=
-  match n with 0 => None | S n =>
-  (* First weak-head reduce using all rules except delta. *)
-  match weak_head_stack RedFlags.nodelta Σ Δ Γ n t1 l1,
-        weak_head_stack RedFlags.nodelta Σ Δ Γ n t2 l2
-  with 
-  | Some (t1, l1), Some (t2, l2) => isconv_prog n pb Γ t1 l1 t2 l2
-  | _, _ => false
-  end
-  end
-with isconv_prog (n : nat) (pb : conv_pb) (Γ : context) 
-  (t1 : term) (l1 : list term) (t2 : term) (l2 : list term) {struct n} : bool :=
-    match n with 0 => None | S n =>
-    (* Helper function to check if two stacks of arguments are element-wise convertible. *)
-    let isconv_stacks l1 l2 : bool :=
-        forallb2 (fun x y => opt_bool_to_bool (isconv n Conv Γ x [] y [])) l1 l2
-    in
-    let on_cond (b : bool) := if b then isconv_stacks l1 l2 else false in
-    (** Test equality at each step. *)
-    if eq_term pb t1 t2 && isconv_stacks l1 l2 then true else
-    let fallback (x : unit) :=
-      match reducible_head n Γ t1 l1 with
-      | Some t1 =>
-        redt <- weak_head_stack nodelta_flags Σ Δ Γ n t1 l1 ;;
-        let '(t1, l1) := redt in
-        isconv_prog n leq Γ t1 l1 t2 l2
-      | None =>
-        match reducible_head n Γ t2 l2 with
-        | Some t2 =>
-          redt <- weak_head_stack nodelta_flags Σ Δ Γ n t2 l2 ;;
-          let '(t2, l2) := redt in
-          isconv_prog n leq Γ t1 l1 t2 l2
-        | None =>
-          on_cond (match leq with
-                   | Conv => eq_term G t1 t2
-                   | Cumul => leq_term G t1 t2 end)
-        end
-      end
-    in
-    match t1, t2 with
-    | tApp f args, tApp f' args' =>
-      None (* Impossible *)
-
-    | tCast t _ v, tCast u _ v' => None (* Impossible *)
-
-    | tConst c u, tConst c' u' => (* TODO Universes *)
-      if c == c' then
-        b <- isconv_stacks l1 l2 ;;
-        if b then ret true (* FO optim *)
-        else
-          match lookup_env c with (* Unfold both bodies at once *)
-          | Some (ConstantDecl {| cst_body := Some body |}) =>
-            isconv n leq Γ body l1 body l2
-          | _ => ret false
-          end
-      else
-        match lookup_env c' with
-        | Some (ConstantDecl {| cst_body := Some body |}) =>
-          isconv n leq Γ t1 l1 body l2
-        | _ =>
-          match lookup_env c with
-          | Some (ConstantDecl {| cst_body := Some body |}) =>
-            isconv n leq Γ body l1 t2 l2
-          | _ => ret false
-          end
-        end
-
-    | tLambda na b t, tLambda _ b' t' =>
-      cnv <- isconv n Conv Γ b [] b' [] ;;
-      if (cnv : bool) then
-        isconv n Conv (Γ ,, vass na b) t [] t' []
-      else ret false
-
-    | tProd na b t, tProd _ b' t' =>
-      cnv <- isconv n Conv Γ b [] b' [] ;;
-      if (cnv : bool) then
-        isconv n leq (Γ ,, vass na b) t [] t' []
-      else ret false
-
-    | tCase ci p c brs,
-      tCase ci' p' c' brs' => (* Hnf did not reduce, maybe delta needed in c *)
-      if eq_case_info ci ci' && eqb_predicate (eqb_univ_instance G) (eq_term G) p p' && eq_term G c c'
-      && forallb2 (fun br br' => eq_term G br.(bbody) br'.(bbody)) brs brs' then
-        ret true
-      else
-        cred <- weak_head_stack_term RedFlags.default Σ Δ Γ n c ;;
-        c'red <- weak_head_stack_term RedFlags.default Σ Δ Γ n c' ;;
-        if eq_term G cred c && eq_term G c'red c' then ret true
-        else
-          isconv n leq Γ (tCase ci p cred brs) l1 (tCase ci' p c'red brs') l2
-
-    | tProj p c, tProj p' c' => on_cond (eq_projection p p' && eq_term G c c')
-
-    | tFix mfix idx, tFix mfix' idx' =>
-      (* Hnf did not reduce, maybe delta needed *)
-      if eq_term G t1 t2 && opt_bool_to_bool (isconv_stacks l1 l2) then ret true
-      else
-        match unfold_one_fix n Γ mfix idx l1 with
-        | Some t1 =>
-          redt <- weak_head_stack nodelta_flags Σ Δ Γ n t1 l1 ;;
-          let '(t1, l1) := redt in
-          isconv_prog n leq Γ t1 l1 t2 l2
-        | None =>
-          match unfold_one_fix n Γ mfix' idx' l2 with
-          | Some t2 =>
-            redt <- weak_head_stack nodelta_flags Σ Δ Γ n t2 l2 ;;
-            let '(t2, l2) := redt in
-            isconv_prog n leq Γ t1 l1 t2 l2
-          | None => ret false
-          end
-        end
-
-    | tCoFix mfix idx, tCoFix mfix' idx' =>
-      on_cond (eq_term G t1 t2)
-
-    | _, _ => fallback ()
-    end
-    end.*)
-
+(** [check_conv pb t t'] checks that [t = t'] modulo conversion (if [pb] is Conv)
+    or cumulativity (if [pb] is Cumul). It uses all reduction rules. 
+    
+    The current implementation is not very efficient : we fully weak-head reduce 
+    at each step. A better solution might be to first reduce using all rules except 
+    unfolding (we would probably use [whd_theta_stack]), and carefully unfold 
+    constants when needed, but this requires backtracking so one has to take extra care 
+    to ensure it is indeed more efficient. 
+    An even better solution would be to use delayed substitutions when reducing.
+    Anyways optimizing this function does not seem worth the effort for the moment. *)
+Fixpoint check_conv (Γ : context) (pb : conv_pb) (t t' : term) {struct pb} : bool :=
+  let red t := weak_head_reduce flags evm Σ Δ Γ t in
+  eq_term_ctx Σ (EvarMap.evm_universes evm) 
+    (fun Γ pb t t' => check_conv Γ pb (red t) (red t')) Γ pb (red t) (red t').
 
 End Conversion.
 
-Definition check_conv `{checker_flags} : 
-  EvarMap.t -> global_env -> named_context -> context -> conv_pb -> term -> term -> bool.
-Admitted.
+(** * Typing. *)
 
-Section Typecheck.
+Inductive type_error :=
+| UnboundRel (n : nat)
+| UnboundVar (id : string)
+| UnboundMeta (m : nat)
+| UnboundEvar (ev : nat)
+| UndeclaredConstant (c : kername)
+| UndeclaredInductive (c : inductive)
+| UndeclaredConstructor (c : inductive) (i : nat)
+| UndeclaredProjection (p : projection)
+| NotConvertible (Γ : context) (t u t' u' : term)
+| NotASort (t : term)
+| NotAProduct (t t' : term)
+| NotAnInductive (t : term)
+| IllFormedFix (m : mfixpoint term) (i : nat)
+| IllFormedProjection (p : projection) (t : term)
+| UnsatisfiedConstraints (c : ConstraintSet.t)
+| UnsatisfiableConstraints (c : ConstraintSet.t)
+| NotSupported (s : string).
+
+Definition string_of_type_error (e : type_error) : string :=
+  match e with
+  | UnboundRel n => "Unboound rel " ^ string_of_nat n
+  | UnboundVar id => "Unbound var " ^ id
+  | UnboundMeta m => "Unbound meta " ^ string_of_nat m
+  | UnboundEvar ev => "Unbound evar " ^ string_of_nat ev
+  | UndeclaredConstant c => "Undeclared constant " ^ string_of_kername c
+  | UndeclaredInductive c => "Undeclared inductive " ^ string_of_kername (inductive_mind c)
+  | UndeclaredConstructor c i => "Undeclared constructor for inductive " ^ string_of_kername (inductive_mind c)
+  | UndeclaredProjection p => "Undeclared projection for for inductive " ^ string_of_kername (inductive_mind p.(proj_ind))
+  | NotConvertible Γ t u t' u' => "Terms are not convertible: " ^
+      string_of_term t ^ " " ^ string_of_term u ^ " after reduction: " ^
+      string_of_term t' ^ " " ^ string_of_term u'
+  | NotASort t => "Not a sort"
+  | NotAProduct t t' => "Not a product"
+  | NotAnInductive t => "Not an inductive"
+  | IllFormedFix m i => "Ill-formed recursive definition"
+  | IllFormedProjection p t => "Ill-formed primitive projection"
+  | UnsatisfiedConstraints c => "Unsatisfied constraints"
+  | UnsatisfiableConstraints c => "Unsatisfiable constraints"
+  | NotSupported s => s ^ " are not supported"
+  end.
+
+(** Typing and retyping functions return a [typing_result]. *)
+Inductive typing_result (A : Type) :=
+| Checked (a : A)
+| TypeError (t : type_error).
+Global Arguments Checked {A} a.
+Global Arguments TypeError {A} t.
+
+Global Instance typing_monad : Monad typing_result :=
+{| ret A a := Checked a ;
+   bind A B m f :=
+     match m with
+     | Checked a => f a
+     | TypeError t => TypeError t
+     end
+|}.
+
+Global Instance monad_exc : MonadExc type_error typing_result :=
+{ raise A e := TypeError e;
+  catch A m f :=
+    match m with
+    | Checked a => m
+    | TypeError t => f t
+    end
+}.
+
+Section Lookups.
+Context (Σ : global_env).
+
+Definition polymorphic_constraints u :=
+  match u with
+  | Monomorphic_ctx => ConstraintSet.empty
+  | Polymorphic_ctx ctx => (AUContext.repr ctx).2.2
+  end.
+
+Definition lookup_constant_type cst u :=
+  match lookup_env Σ cst with
+  | Some (ConstantDecl {| cst_type := ty; cst_universes := uctx |}) =>
+    ret (subst_instance u ty)
+  |  _ => raise (UndeclaredConstant cst)
+  end.
+
+Definition lookup_constant_type_cstrs cst u :=
+  match lookup_env Σ cst with
+  | Some (ConstantDecl {| cst_type := ty; cst_universes := uctx |}) =>
+    let cstrs := polymorphic_constraints uctx in
+    ret (subst_instance u ty, subst_instance_cstrs u cstrs)
+    |  _ => raise (UndeclaredConstant cst)
+  end.
+
+Definition lookup_ind_decl ind i :=
+  match lookup_env Σ ind with
+  | Some (InductiveDecl mdecl) =>
+    match nth_error mdecl.(ind_bodies) i with
+    | Some body => ret (mdecl, body)
+    | None => raise (UndeclaredInductive (mkInd ind i))
+    end
+  | _ => raise (UndeclaredInductive (mkInd ind i))
+  end.
+
+Definition lookup_ind_type ind i (u : list Level.t) :=
+  res <- lookup_ind_decl ind i ;;
+  ret (subst_instance u (snd res).(ind_type)).
+
+Definition lookup_ind_type_cstrs ind i (u : list Level.t) :=
+  '(mib, body) <- lookup_ind_decl ind i ;;
+  let uctx := mib.(ind_universes) in
+  let cstrs := polymorphic_constraints uctx in
+  ret (subst_instance u body.(ind_type), subst_instance_cstrs u cstrs).
+
+Definition lookup_constructor_decl ind i k :=
+  '(mib, body) <- lookup_ind_decl ind i;;
+  match nth_error body.(ind_ctors) k with
+  | Some cdecl => ret (mib, cdecl)
+  | None => raise (UndeclaredConstructor (mkInd ind i) k)
+  end.
+
+Definition lookup_constructor_type ind i k u :=
+  '(mib, cdecl) <- lookup_constructor_decl ind i k ;;
+  ret (subst0 (inds ind u mib.(ind_bodies)) (subst_instance u cdecl.(cstr_type))).
+
+Definition lookup_constructor_type_cstrs ind i k u :=
+  '(mib, cdecl) <- lookup_constructor_decl ind i k ;;
+  let cstrs := polymorphic_constraints mib.(ind_universes) in
+  ret (subst0 (inds ind u mib.(ind_bodies)) (subst_instance u cdecl.(cstr_type)),
+      subst_instance_cstrs u cstrs).
+
+Definition lookup_projection_type p c args u :=
+  match lookup_projection Σ p with
+  | Some (_, _, _, pbody) =>
+    ret (subst0 (c :: rev args) (subst_instance u pbody.(proj_type)))
+  | None => raise (UndeclaredProjection p)
+  end.
+
+End Lookups.
+
+Section Typing.
 Context `{checker_flags} (evm : EvarMap.t) (Σ : global_env) (Δ : named_context).
 
 (** [reduce_to_sort t] weak-head reduces [t] to a sort. *)
@@ -719,7 +728,7 @@ Variable (infer : context -> term -> typing_result term).
   
 Definition infer_cumul Γ t t' : typing_result unit :=
   tx <- infer Γ t ;;
-  if check_conv evm Σ Δ Γ Cumul tx t' then ret tt 
+  if check_conv RedFlags.all evm Σ Δ Γ Cumul tx t' then ret tt 
   else raise (NotConvertible Γ tx t' tx t').
 
 Fixpoint infer_spine (Γ : context) (ty : term) (l : list term) {struct l} : typing_result term :=
@@ -731,9 +740,9 @@ Fixpoint infer_spine (Γ : context) (ty : term) (l : list term) {struct l} : typ
      infer_spine Γ (subst10 x b1) xs
   end.
 
-  Definition infer_type Γ t :=
-    tx <- infer Γ t ;;
-    reduce_to_sort Γ tx.
+Definition infer_type Γ t :=
+  tx <- infer Γ t ;;
+  reduce_to_sort Γ tx.
 
 End InferAux.
 
@@ -741,6 +750,7 @@ Definition check_consistent_constraints cstrs :=
   if check_constraints (EvarMap.evm_universes evm) cstrs then ret tt
   else raise (UnsatisfiedConstraints cstrs).
 
+(** [infer Γ t] checks [t] is well-typed in local context Γ and returns its type. *)
 Fixpoint infer (Γ : context) (t : term) : typing_result term :=
   match t with
   | tRel n =>
@@ -851,7 +861,7 @@ Fixpoint infer (Γ : context) (t : term) : typing_result term :=
   | tInt _ | tFloat _ | tString _ | tArray _ _ _ _ => raise (NotSupported "primitive types")
   end.
   
-(** [check t ty] checks that [t] has type [ty], assuming that [ty] is itself well-typed. *)
+(** [check t ty] checks that [t] has type [ty], assuming [ty] is itself well-typed. *)
 Definition check (Γ : context) (t : term) (ty : term) : typing_result unit :=
   infer_type infer Γ ty ;;
   infer_cumul infer Γ t ty.
@@ -863,10 +873,9 @@ Definition typechecking (Γ : context) (t ty : term) : bool :=
   | TypeError _ => false
   end.
 
-End Typecheck.
+End Typing.
 
 Arguments bind _ _ _ _ ! _.
-Open Scope monad.
 
 Fixpoint fresh id (env : global_declarations) : bool :=
   match env with
@@ -875,8 +884,7 @@ Fixpoint fresh id (env : global_declarations) : bool :=
   end.
 
 Section Checker.
-
-Context {cf : checker_flags}.
+Context `{checker_flags}.
 
 Inductive env_error :=
 | IllFormedDecl (e : string) (e : type_error)
@@ -971,6 +979,8 @@ Definition typecheck_program (p : program) : EnvCheck term :=
   end.
 
 End Checker.
+
+(** * Retyping. *)
 
 Section Retyping.
 Context `{checker_flags} (evm : EvarMap.t) (Σ : global_env) (Δ : named_context).

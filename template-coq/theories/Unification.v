@@ -347,29 +347,6 @@ Definition ise_list2 {A B} (f : A -> B -> EvarMap.t -> M EvarMap.t)
   if #|xs| == #|ys| then loop xs ys evm 
   else failM $ str "ise_list2 : incompatible argument sizes".
 
-(** [rebuild_case env ci pred bs] rebuilds the terms corresponding to the 
-    case predicate and branches of [tCase ci pred _ bs]. 
-    This involves adding lambda abstractions and let-ins as needed. *)
-Definition rebuild_case Σ ci pred bs : option (term * list term) :=
-  match lookup_inductive Σ ci.(ci_ind) with 
-  | None => None 
-  | Some (mbody, body) =>
-    (* Add abstractions to the predicate. *)
-    let pred_ctx := case_predicate_context ci.(ci_ind) mbody body pred in
-    let pred_term := it_mkLambda_or_LetIn pred_ctx pred.(preturn) in 
-    (* Add abstractions to each branch. *)
-    let bs_terms := 
-      map2 
-        (fun b cbody =>
-          let b_ctx := case_branch_context ci.(ci_ind) mbody cbody pred b in
-          it_mkLambda_or_LetIn b_ctx b.(bbody))
-        bs
-        body.(ind_ctors)
-    in
-    (* Return the updated predicate and branches. *)
-    Some (pred_term, bs_terms)
-  end.
-
 (** [find_unique cond xs] checks if there is exactly one element in [xs] that satisfies
     the condition [cond], and if so returns its index. *)
 Definition find_unique {A} (cond : A -> bool) (xs : list A) : option nat :=
@@ -744,7 +721,7 @@ Definition try_conv Γ pb (t t' : tapp) evm : M (EvarMap.t) :=
   let t := mkApps t.1 t.2 in
   let t' := mkApps t'.1 t'.2 in
   if is_evarfree t && is_evarfree t' then 
-    if Checker.check_conv evm Σ Δ Γ pb t t' 
+    if check_conv RedFlags.all evm Σ Δ Γ pb t t' 
     then let* _ := log_str "Reduce-Same" in retM evm
     else failM $ str "Reduce-Same : not convertible"
   else failM $ str "Reduce-Same : terms contain evars".
@@ -755,8 +732,6 @@ End TryConv.
 
 Section TryAppFO.
 Context (unify : unif_fun term).
-
-Print comparison.
 
 (** Structurally unify the heads of two terms. *)
 Definition unify_head Γ pb (t t' : term) evm : M EvarMap.t :=
@@ -1249,11 +1224,11 @@ Definition test :=
   let t1 := tLam "arg" ($quote (list nat)) t1_body in
   let t2 := mkApps ($quote In) [ $quote nat ; tVar y1 ] in
   (* Unify the terms. *)
-  let (log, res) := @unify PrettyFlags.default default_checker_flags env Δy [] Conv t1 t2 evm UnifFlags.default in
+  let (log, res) := @unify PrettyFlags.default env Δy [] Conv t1 t2 evm UnifFlags.default in
   let log_str := pp_string 120 $ @Log.print PrettyFlags.default env log in
   let res_str :=
     match res with 
-    | Success evm => pp_string 120 $ @EvarMap.print PrettyFlags.default (env, Monomorphic_ctx) evm
+    | UnifSuccess evm => pp_string 120 $ @EvarMap.print PrettyFlags.default (env, Monomorphic_ctx) evm
     | UnifError => "error"%pstring
     end 
   in
